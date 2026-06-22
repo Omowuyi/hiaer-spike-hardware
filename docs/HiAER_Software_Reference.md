@@ -1,7 +1,7 @@
 # HiAER-Spike Software Reference
 ## Packet Formats, Bit Fields, HBM Organization, and Test Design Guide
 
-**For:** Software Team (Gwen, Christopher, connectome_utils/hs_api/hs_bridge)  
+**For:** Software Team  
 **From:** Omowuyi Olajide (Hardware)  
 **Date:** June 2026  
 **Hardware Version:** NoC-integrated 16-core (builds on multicore_4 baseline)  
