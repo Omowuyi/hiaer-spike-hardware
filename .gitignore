@@ -1,0 +1,16 @@
+*.bit
+*.jou
+*.log
+*.wdb
+*.pb
+*.dcp
+*.str
+work_*/
+xsim.dir/
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+.Xil/
+__pycache__/
