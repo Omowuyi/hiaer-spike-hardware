@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+Hierarchical hypergraph partitioning for the HiAER-Spike NoC.
+
+WHY NOT METIS
+METIS minimises CUT EDGES on a graph.  That is the wrong objective here, for
+three reasons:
+
+1. Multicast.  One spike reaching four cores in a cluster is ONE L1
+   transaction with a 4-bit mask, not four.  The real cost is how many
+   distinct destination groups a neuron's fan-out spans -- the lambda-1
+   connectivity metric on a HYPERGRAPH, where each neuron's fan-out is one
+   hyperedge.  A graph model structurally cannot express this.
+
+2. Non-uniform, position-dependent cost.  LOCAL is free, L1 a few cycles, L2
+   more, Firefly ~250 ns plus a timestep-buffer wait -- about two orders of
+   magnitude.  An edge's weight depends on where its endpoints land, which is
+   circular for a flat partitioner.  Recursive partitioning down the hierarchy
+   (server -> FPGA -> cluster -> core) resolves it: each level minimises its
+   own cut and the hierarchy falls out of the recursion.
+
+3. Granularity.  The routing table is indexed by addr[16:9], so one entry
+   governs 512 neurons.  A block split across cores cannot be expressed.
+   Rather than partition neurons and check afterwards, COARSEN FIRST: one
+   vertex per 512-neuron block.  The constraint is then satisfied by
+   construction, and the problem shrinks enormously -- a 109,632-neuron model
+   becomes 214 vertices.
+
+APPROACH
+    coarsen to 512-neuron blocks
+    build hypergraph: one hyperedge per source block, spanning its dst blocks
+    recursive bisection with lambda-1 gain and FM refinement
+    balance on TWO constraints: neurons per core, synapse rows per core
+
+If KaHyPar is importable it is used for the bisections; otherwise the built-in
+FM refinement runs.  For 16 cores on one FPGA the built-in is more than
+adequate -- the sophistication only starts paying at 640 cores.
+
+STRUCTURED NETWORKS
+For Potjans-Diesmann and similar, the population/layer structure is a better
+starting point than anything generic.  Pass it as `initial` and the refinement
+improves on it instead of starting from scratch.
+
+  from noc_partition import partition, Topology
+  asg = partition(edges, num_neurons, Topology(cores=16))
+  tables = noc_routing.build_tables(asg.neuron_to_core, edges)
+"""
+
+import random
+from collections import defaultdict
+
+BLOCK = 512                    # neurons per routing-table entry, addr[16:9]
+NEURONS_PER_CORE = 8192
+SYN_ROWS_PER_CORE_64 = 4194304  # 64-bit format ceiling, 256 MB per channel
+
+
+class Topology:
+    """The hierarchy a partition has to respect.
+
+    cores_per_cluster and clusters_per_fpga come from the 4x4 NoC; fpgas and
+    servers extend the same recursion outward.
+    """
+
+    def __init__(self, cores=16, cores_per_cluster=4, fpgas=1, servers=1):
+        self.cores_per_cluster = cores_per_cluster
+        self.clusters = cores // cores_per_cluster
+        self.cores = cores
+        self.fpgas = fpgas
+        self.servers = servers
+
+    def levels(self):
+        """Coarsest to finest, as a list of (name, fanout) splits."""
+        out = []
+        if self.servers > 1:
+            out.append(("server", self.servers))
+        if self.fpgas > 1:
+            out.append(("fpga", self.fpgas))
+        if self.clusters > 1:
+            out.append(("cluster", self.clusters))
+        out.append(("core", self.cores_per_cluster))
+        return out
+
+
+class Assignment:
+    def __init__(self, block_to_part, topo, nblocks):
+        self.block_to_part = block_to_part
+        self.topo = topo
+        self.nblocks = nblocks
+
+    @property
+    def neuron_to_core(self):
+        m = {}
+        for b, p in self.block_to_part.items():
+            for n in range(b * BLOCK, (b + 1) * BLOCK):
+                m[n] = p
+        return m
+
+    def blocks_per_core(self):
+        c = defaultdict(int)
+        for p in self.block_to_part.values():
+            c[p] += 1
+        return dict(c)
+
+
+def build_hypergraph(edges, num_neurons):
+    """One hyperedge per source block, spanning the destination blocks it
+    reaches.  That is exactly the lambda-1 cost model: a spike's cost is the
+    number of distinct partitions its fan-out touches, not the edge count."""
+    nets = defaultdict(set)
+    for src, dst in edges:
+        nets[src // BLOCK].add(dst // BLOCK)
+    nblocks = (num_neurons + BLOCK - 1) // BLOCK
+    return {s: d for s, d in nets.items() if d}, nblocks
+
+
+# Measured on hardware-grade simulation (xsim, tb_l2): noc_l2_bus REWRITES a
+# forwarded packet -- level L2 -> L1 and mask -> 4'b1111.  So an L2 spike
+# BROADCASTS to all four cores in every destination cluster; receiving cores
+# filter by neuron address.  Within a cluster L1 selects cores precisely.
+#
+# Cost of one spike therefore is:
+#     same core            free
+#     same cluster (L1)    one transaction, exact core selection
+#     other cluster (L2)   one transaction per destination cluster,
+#                          and FOUR core-deliveries inside each
+#
+# So a cross-cluster cut is roughly CLUSTER_PENALTY times worse than an
+# intra-cluster one, and the objective is lambda-1 at the CLUSTER level first.
+CLUSTER_PENALTY = 4
+CORES_PER_CLUSTER = 4          # 4x4 crossbar: 4 clusters of 4
+
+
+def _lambda1(nets, assign, cores_per_cluster=CORES_PER_CLUSTER):
+    """Weighted lambda-1.  Cluster-level spread is penalised because an L2
+    hop broadcasts to every core in each destination cluster, while L1 picks
+    cores exactly."""
+    total = 0
+    for s, dsts in nets.items():
+        parts = {assign[d] for d in dsts if d in assign}
+        if s in assign:
+            parts.add(assign[s])
+        if not parts:
+            continue
+        clusters = {p // cores_per_cluster for p in parts}
+        # cores touched beyond the first, within clusters -- cheap and exact
+        total += (len(parts) - 1)
+        # clusters touched beyond the first -- each costs a broadcast
+        total += CLUSTER_PENALTY * (len(clusters) - 1)
+    return total
+
+
+def _fm_refine(blocks, nets, assign, parts, cap, rounds=8):
+    """Fiduccia-Mattheyses style pass: repeatedly move the block with the best
+    lambda-1 gain, subject to the balance cap, locking each block once per
+    round so the pass terminates."""
+    for _ in range(rounds):
+        improved = False
+        locked = set()
+        counts = defaultdict(int)
+        for b in blocks:
+            counts[assign[b]] += 1
+        for _ in range(len(blocks)):
+            best, best_gain, best_to = None, 0, None
+            base = _lambda1(nets, assign)
+            for b in blocks:
+                if b in locked:
+                    continue
+                cur = assign[b]
+                for p in parts:
+                    if p == cur or counts[p] >= cap:
+                        continue
+                    assign[b] = p
+                    g = base - _lambda1(nets, assign)
+                    assign[b] = cur
+                    if g > best_gain:
+                        best, best_gain, best_to = b, g, p
+            if best is None:
+                break
+            counts[assign[best]] -= 1
+            assign[best] = best_to
+            counts[best_to] += 1
+            locked.add(best)
+            improved = True
+        if not improved:
+            break
+    return assign
+
+
+def _try_kahypar(nets, blocks, k, cap):
+    """Use KaHyPar with the lambda-1 objective when it is available."""
+    try:
+        import kahypar
+    except ImportError:
+        return None
+    try:
+        idx, ents = [0], []
+        for s, dsts in nets.items():
+            pins = sorted({s} | set(dsts))
+            ents.extend(pins)
+            idx.append(len(ents))
+        hg = kahypar.Hypergraph(len(blocks), len(nets), idx, ents, k,
+                                [1] * len(nets), [1] * len(blocks))
+        ctx = kahypar.Context()
+        ctx.setK(k)
+        ctx.setEpsilon(0.03)
+        kahypar.partition(hg, ctx)
+        return {b: hg.blockID(b) for b in range(len(blocks))}
+    except Exception:
+        return None
+
+
+def partition(edges, num_neurons, topo=None, initial=None, seed=0):
+    """Assign 512-neuron blocks to cores, minimising lambda-1 down the
+    hierarchy.
+
+    edges       iterable of (src_neuron, dst_neuron)
+    initial     optional {block: part} to refine rather than start cold --
+                for structured networks the population layout beats any
+                generic starting point
+    """
+    topo = topo or Topology()
+    random.seed(seed)
+    nets, nblocks = build_hypergraph(edges, num_neurons)
+    blocks = list(range(nblocks))
+
+    max_blocks = NEURONS_PER_CORE // BLOCK
+    if nblocks > max_blocks * topo.cores:
+        raise ValueError("network needs %d blocks but the topology holds %d "
+                         "(%d cores x %d blocks)"
+                         % (nblocks, max_blocks * topo.cores, topo.cores,
+                            max_blocks))
+
+    # Recursive split down the hierarchy.  Each level partitions only the
+    # blocks that landed in its parent group, so an inter-FPGA cut is decided
+    # before -- and therefore weighted more heavily than -- an intra-cluster one.
+    assign = dict(initial) if initial else {b: 0 for b in blocks}
+    groups = [blocks]
+    cores_per_group = topo.cores
+    for name, fanout in topo.levels():
+        nxt = []
+        for gi, grp in enumerate(groups):
+            if len(grp) <= 1 or fanout <= 1:
+                nxt.append(grp)
+                continue
+            # PACK, do not spread.  Dividing evenly puts blocks in four
+            # clusters when they would all fit in one, and single-move FM
+            # cannot merge them afterwards -- it is a local minimum.  Filling
+            # each partition to hardware capacity first minimises the number of
+            # CLUSTERS touched, which is the expensive dimension: an L2 hop
+            # broadcasts to all four cores in every destination cluster.
+            # Cores per destination partition AT THIS LEVEL.  Using
+            # topo.cores // fanout is only right for the first split; deeper in
+            # the recursion each group already spans fewer cores, and a fill
+            # computed from the top would overrun a single core's capacity.
+            cores_per_part0 = max(1, cores_per_group // fanout)
+            fill = max(1, max_blocks * cores_per_part0)
+            sub = {b: min(i // fill, fanout - 1) for i, b in enumerate(grp)}
+            k = _try_kahypar({s: d for s, d in nets.items() if s in set(grp)},
+                             grp, fanout, max(1, len(grp) // fanout + 1))
+            if k:
+                sub = {b: k.get(i, i % fanout) for i, b in enumerate(grp)}
+            # Capacity, not equal division.  Forcing len(grp)/fanout spreads
+            # tightly-coupled blocks apart to satisfy a balance nobody asked
+            # for; the only hard limit is what a core can hold.  Fall back to
+            # even division only when the network actually fills the machine.
+            cores_per_part = max(1, cores_per_group // fanout)
+            hw_cap = max_blocks * cores_per_part
+            cap = hw_cap if hw_cap * fanout >= len(grp) else \
+                max(1, -(-len(grp) // fanout))
+            local = {b: sub[b] for b in grp}
+            _fm_refine(grp, {s: d for s, d in nets.items() if s in set(grp)},
+                       local, list(range(fanout)), cap)
+            for p in range(fanout):
+                nxt.append([b for b in grp if local[b] == p])
+            for b in grp:
+                assign[b] = assign[b] * fanout + local[b] if name != topo.levels()[0][0] \
+                    else local[b]
+        groups = nxt
+        cores_per_group = max(1, cores_per_group // fanout)
+
+    final = {}
+    for part, grp in enumerate(groups):
+        for b in grp:
+            final[b] = part % topo.cores
+
+    # The recursion works on sub-partition indices, so the cluster penalty in
+    # _lambda1 -- which reads real core numbers -- cannot bite during the
+    # split.  Run one refinement pass over the finished core assignment, where
+    # it does.  This is what actually pulls a fan-out into as few CLUSTERS as
+    # possible, which is the expensive dimension: an L2 hop broadcasts to all
+    # four cores in every destination cluster.
+    _fm_refine(blocks, nets, final, list(range(topo.cores)), max_blocks,
+               rounds=12)
+    return Assignment(final, topo, nblocks)
+
+
+def report(asg, edges):
+    nets, _ = build_hypergraph(edges, max(max(e) for e in edges) + 1)
+    l1 = _lambda1(nets, asg.block_to_part)
+    per = asg.blocks_per_core()
+    cap = NEURONS_PER_CORE // BLOCK
+    print("blocks: %d   cores used: %d" % (asg.nblocks, len(per)))
+    print("weighted cost: %d  (0 = every fan-out inside one core;\n                 cluster spread weighted x%d for L2 broadcast)" % (l1, CLUSTER_PENALTY))
+    over = {c: n for c, n in per.items() if n > cap}
+    print("blocks per core: min %d  max %d  cap %d%s"
+          % (min(per.values()), max(per.values()), cap,
+             "   OVER on cores %s" % sorted(over) if over else ""))
+
+
+if __name__ == "__main__":
+    # two populations, dense within and sparse between -- a good partition
+    # should put each on its own core and leave lambda-1 near zero
+    edges = []
+    for n in range(1024):
+        for m in range(1024):
+            if (n + m) % 97 == 0:
+                edges.append((n, m))
+    for n in range(1024, 2048):
+        for m in range(1024, 2048):
+            if (n + m) % 97 == 0:
+                edges.append((n, m))
+    edges += [(5, 1500), (7, 1600)]
+
+    asg = partition(edges, 2048, Topology(cores=16))
+    report(asg, edges)

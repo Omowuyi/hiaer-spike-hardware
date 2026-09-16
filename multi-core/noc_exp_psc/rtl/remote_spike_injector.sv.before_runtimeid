@@ -1,0 +1,205 @@
+//=============================================================================
+// Remote Spike Injector Module
+//
+// Converts 64-bit FireFly spikes (inter_fpga_spike_t) to 512-bit NoC format
+// for injection into the local switch_1_16.
+//
+// Features:
+// - Batches up to 14 spikes before sending a packet
+// - Timeout mechanism to flush partial batches
+// - Handles spike format conversion
+//
+// Output Packet Format (512-bit):
+//   [511:480] - Header (0xFFFF_FFFF for remote spike packet)
+//   [479:448] - Spike 13
+//   ...
+//   [63:32]   - Spike 0
+//   [31:0]    - Timestamp/flags
+//
+// Each 32-bit spike:
+//   [31:24]   - Timestamp
+//   [23]      - Valid bit
+//   [22:17]   - Reserved/Flags
+//   [16:0]    - Destination neuron address
+//=============================================================================
+
+module remote_spike_injector
+    import hiaer_firefly_pkg::*;
+#(
+    parameter logic [2:0] LOCAL_FPGA_ID = 3'd0,
+    parameter int BATCH_SIZE = 14,
+    parameter int TIMEOUT_CYCLES = 256
+)(
+    input  logic            aclk,
+    input  logic            aresetn,
+    
+    //=========================================================================
+    // Input from FireFly (64-bit inter_fpga_spike_t)
+    //=========================================================================
+    input  inter_fpga_spike_t   firefly_spike,
+    input  logic                firefly_valid,
+    output logic                firefly_ready,
+    
+    //=========================================================================
+    // Output to NoC (512-bit format to switch_1_16)
+    //=========================================================================
+    output logic [511:0]    m_axis_tdata,
+    output logic [3:0]      m_axis_tdest,
+    output logic            m_axis_tvalid,
+    input  logic            m_axis_tready
+);
+
+    //=========================================================================
+    // Constants
+    //=========================================================================
+    
+    localparam REMOTE_HEADER = 32'hFFFF_FFFF;  // Identifies remote spike packet
+    
+    //=========================================================================
+    // State Machine
+    //=========================================================================
+    
+    typedef enum logic [1:0] {
+        ST_COLLECT,
+        ST_SEND,
+        ST_WAIT
+    } state_t;
+    
+    state_t state;
+    
+    //=========================================================================
+    // Batch Buffer
+    //=========================================================================
+    
+    logic [31:0]    batch_buffer [BATCH_SIZE-1:0];
+    logic [3:0]     batch_dest [BATCH_SIZE-1:0];
+    logic [3:0]     batch_count;
+    logic [9:0]     timeout_counter;
+    
+    // Primary destination (from first spike in batch)
+    logic [3:0]     primary_dest;
+    logic [7:0]     primary_timestamp;
+    
+    //=========================================================================
+    // Spike Format Conversion
+    //=========================================================================
+    
+    // Convert 64-bit inter_fpga_spike_t to 32-bit NoC spike format
+    function automatic logic [31:0] convert_spike(input inter_fpga_spike_t spike);
+        logic [31:0] result;
+        // [31:24] = timestamp
+        result[31:24] = spike.timestamp;
+        // [23] = valid
+        result[23] = 1'b1;
+        // [22:17] = flags/reserved
+        result[22:17] = 6'b0;
+        // [16:0] = destination neuron (encode core + neuron)
+        result[16:14] = spike.dst_fpga;      // Should be LOCAL_FPGA_ID for received spikes
+        result[13:10] = spike.dst_core;
+        result[9:0] = spike.dst_neuron[9:0]; // Lower 10 bits of neuron ID
+        return result;
+    endfunction
+    
+    //=========================================================================
+    // Batch Collection and Output
+    //=========================================================================
+    
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            state <= ST_COLLECT;
+            batch_count <= 4'd0;
+            timeout_counter <= 10'd0;
+            primary_dest <= 4'd0;
+            primary_timestamp <= 8'd0;
+            
+            for (int i = 0; i < BATCH_SIZE; i++) begin
+                batch_buffer[i] <= 32'd0;
+                batch_dest[i] <= 4'd0;
+            end
+        end else begin
+            case (state)
+                ST_COLLECT: begin
+                    if (firefly_valid && firefly_ready) begin
+                        // Only accept spikes destined for this FPGA
+                        if (firefly_spike.dst_fpga == LOCAL_FPGA_ID) begin
+                            // Add spike to batch
+                            batch_buffer[batch_count] <= convert_spike(firefly_spike);
+                            batch_dest[batch_count] <= firefly_spike.dst_core;
+                            
+                            // Record first spike's destination as primary
+                            if (batch_count == 0) begin
+                                primary_dest <= firefly_spike.dst_core;
+                                primary_timestamp <= firefly_spike.timestamp;
+                            end
+                            
+                            batch_count <= batch_count + 1;
+                            timeout_counter <= 10'd0;
+                            
+                            // Check if batch is full
+                            if (batch_count == BATCH_SIZE - 1) begin
+                                state <= ST_SEND;
+                            end
+                        end
+                        // Spikes not for this FPGA are dropped (should have been forwarded by router)
+                    end else if (batch_count > 0) begin
+                        // Timeout handling for partial batches
+                        timeout_counter <= timeout_counter + 1;
+                        if (timeout_counter >= TIMEOUT_CYCLES) begin
+                            state <= ST_SEND;
+                        end
+                    end
+                end
+                
+                ST_SEND: begin
+                    if (m_axis_tready) begin
+                        // Clear batch after sending
+                        batch_count <= 4'd0;
+                        timeout_counter <= 10'd0;
+                        
+                        for (int i = 0; i < BATCH_SIZE; i++) begin
+                            batch_buffer[i] <= 32'd0;
+                            batch_dest[i] <= 4'd0;
+                        end
+                        
+                        state <= ST_COLLECT;
+                    end
+                end
+                
+                default: state <= ST_COLLECT;
+            endcase
+        end
+    end
+    
+    //=========================================================================
+    // Input Ready
+    //=========================================================================
+    
+    assign firefly_ready = (state == ST_COLLECT) && (batch_count < BATCH_SIZE);
+    
+    //=========================================================================
+    // Output Packet Assembly
+    //=========================================================================
+    
+    always_comb begin
+        m_axis_tdata = 512'd0;
+        
+        // Header
+        m_axis_tdata[511:480] = REMOTE_HEADER;
+        
+        // Timestamp/flags in lower 32 bits
+        m_axis_tdata[31:24] = primary_timestamp;
+        m_axis_tdata[23:0] = 24'd0;
+        
+        // Pack batched spikes (positions 32-479)
+        for (int i = 0; i < BATCH_SIZE; i++) begin
+            m_axis_tdata[32*(i+1) +: 32] = batch_buffer[i];
+        end
+    end
+    
+    // Use primary destination (first spike's core)
+    assign m_axis_tdest = primary_dest;
+    
+    // Valid when in SEND state and batch has data
+    assign m_axis_tvalid = (state == ST_SEND) && (batch_count > 0);
+
+endmodule : remote_spike_injector

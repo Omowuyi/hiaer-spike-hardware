@@ -1,0 +1,183 @@
+//=============================================================================
+// noc_integration.v
+//
+// Wires 16 biological cores to the 4x4 crossbar NoC.
+//
+// WHY THIS IS ALL THAT IS NEEDED
+// cores_with_noc.sv instantiates ONLY the interconnect -- noc_spike_router x16,
+// noc_spike_injector x16, noc_l1_bus x4, noc_l2_bus x1.  It does NOT instantiate
+// cores.  Its entire interface to them is three 17-bit spike paths:
+//
+//     core_spike_addr[c]       spikes OUT of core c
+//     core_noc_relay_addr[c]   spikes IN to core c
+//     host_spike_addr[c]       spikes to the host
+//
+// So the NoC never touches the IEP, CMD 13 PSC parameters, CMD 14 axon delay,
+// the delay buffers, the STDP controller or the 64-bit synapse path.  Every
+// biological feature -- working or not -- comes across intact simply by using
+// the biological single_core.sv.
+//
+// And single_core.sv ALREADY carries the matching ports:
+//
+//     output [16:0] noc_spike_out_addr / noc_spike_out_valid / input ready
+//     input  [16:0] noc_relay_din      / noc_relay_wren      / output full
+//
+// wired into the EEP with NOC_FIFO_DEPTH(512).  The injector emits exactly
+// noc_relay_addr / noc_relay_valid / noc_relay_full.  The interfaces line up
+// with no adaptation.
+//
+// WHAT STILL HAS TO CHANGE ELSEWHERE
+//   1. core_wrapper.sv must pass the six single_core NoC ports up to its own
+//      port list.  It currently exposes only AXI-Stream and HBM.
+//   2. The command interpreter needs the routing-table write command and must
+//      drive route_cfg_valid / core / addr / data.  Opcode 13 collides with
+//      the biological CI's PSC parameters, so use opcode 15.
+//   3. The top level instantiates this module alongside its 16 core_wrappers.
+//
+// ROUTING TABLE, as verified from the RTL
+//   Per core, 256 entries, indexed by spike_addr[16:9] -- one entry per
+//   512-neuron block.  Six bits: [5:4] level, [3:0] mask.
+//   OP_NOP=00, OP_LOCAL=01, OP_L1=10, OP_L2=11.  Reset {OP_LOCAL, 4'b0000}.
+//   noc_spike_router verified in simulation: table writes land, LOCAL goes to
+//   host, L1/L2 emit the configured level and mask, NOP falls through to host.
+//=============================================================================
+
+module noc_integration #(
+    parameter NUM_CORES = 16
+)(
+    input  wire clk,
+    input  wire resetn,
+
+    //=========================================================================
+    // To/from the cores.  Connect straight to core_wrapper once it passes the
+    // single_core NoC ports through.
+    //=========================================================================
+    input  wire [18:0] core_spike_out_addr  [NUM_CORES-1:0],
+    input  wire        core_spike_out_valid [NUM_CORES-1:0],
+    output wire        core_spike_out_ready [NUM_CORES-1:0],
+
+    output wire [18:0] core_relay_din       [NUM_CORES-1:0],
+    output wire        core_relay_wren      [NUM_CORES-1:0],
+    input  wire        core_relay_full      [NUM_CORES-1:0],
+
+    input  wire        core_exec_run        [NUM_CORES-1:0],
+
+    //=========================================================================
+    // Spikes destined for the host.  Feed these into the existing per-core
+    // spike path so PCIe readout is unchanged.
+    //=========================================================================
+    output wire [18:0] host_spike_addr      [NUM_CORES-1:0],
+    output wire        host_spike_valid     [NUM_CORES-1:0],
+    input  wire        host_spike_ready     [NUM_CORES-1:0],
+
+    //=========================================================================
+    // Routing table programming -- PER CORE, straight from each core's CI.
+    //
+    // Every core has its own command_interpreter, and a CMD 15 already reaches
+    // the right one via tdest / coreID.  So core c's CI programs core c's own
+    // router and the packet carries no core field.  cores_with_noc still wants
+    // a single bundle with a selector, so they are combined below: only one
+    // core receives a given CMD 15, so at most one asserts at a time.
+    //=========================================================================
+    input  wire        core_route_cfg_valid [NUM_CORES-1:0],
+    input  wire [7:0]  core_route_cfg_addr  [NUM_CORES-1:0],
+    input  wire [5:0]  core_route_cfg_data  [NUM_CORES-1:0]
+);
+
+    //=========================================================================
+    // Combine the per-core routing writes into the single bundle the
+    // interconnect expects.  Priority encode rather than OR the address and
+    // data: if two cores ever asserted together, ORing would silently write a
+    // corrupted entry, while the encoder writes one correctly and drops the
+    // other.  Losing a write that can be re-sent beats writing a wrong route.
+    //=========================================================================
+    reg        route_cfg_valid;
+    reg [3:0]  route_cfg_core;
+    reg [7:0]  route_cfg_addr;
+    reg [5:0]  route_cfg_data;
+
+    integer rc;
+    always @(*) begin
+        route_cfg_valid = 1'b0;
+        route_cfg_core  = 4'd0;
+        route_cfg_addr  = 8'd0;
+        route_cfg_data  = 6'd0;
+        for (rc = NUM_CORES-1; rc >= 0; rc = rc - 1) begin
+            if (core_route_cfg_valid[rc]) begin
+                route_cfg_valid = 1'b1;
+                route_cfg_core  = rc[3:0];
+                route_cfg_addr  = core_route_cfg_addr[rc];
+                route_cfg_data  = core_route_cfg_data[rc];
+            end
+        end
+    end
+
+    //=========================================================================
+    // cores_with_noc uses unpacked SystemVerilog arrays with packed element
+    // types; these locals adapt the per-core wire arrays above to that shape
+    // without changing either side.
+    //=========================================================================
+    logic [18:0]           w_core_spike_addr  [NUM_CORES-1:0];
+    logic [NUM_CORES-1:0]  w_core_spike_valid;
+    logic [NUM_CORES-1:0]  w_core_spike_ready;
+
+    logic [18:0]           w_relay_addr       [NUM_CORES-1:0];
+    logic [NUM_CORES-1:0]  w_relay_valid;
+    logic [NUM_CORES-1:0]  w_relay_full;
+
+    logic [18:0]           w_host_addr        [NUM_CORES-1:0];
+    logic [NUM_CORES-1:0]  w_host_valid;
+    logic [NUM_CORES-1:0]  w_host_ready;
+
+    logic [NUM_CORES-1:0]  w_exec_run;
+
+    genvar c;
+    generate
+        for (c = 0; c < NUM_CORES; c = c + 1) begin : gen_adapt
+            assign w_core_spike_addr[c]  = core_spike_out_addr[c];
+            assign w_core_spike_valid[c] = core_spike_out_valid[c];
+            assign core_spike_out_ready[c] = w_core_spike_ready[c];
+
+            assign core_relay_din[c]  = w_relay_addr[c];
+            assign core_relay_wren[c] = w_relay_valid[c];
+            assign w_relay_full[c]    = core_relay_full[c];
+
+            assign host_spike_addr[c]  = w_host_addr[c];
+            assign host_spike_valid[c] = w_host_valid[c];
+            assign w_host_ready[c]     = host_spike_ready[c];
+
+            assign w_exec_run[c] = core_exec_run[c];
+        end
+    endgenerate
+
+    //=========================================================================
+    // The interconnect.  Routers, injectors, L1 buses and the L2 bus all live
+    // inside; nothing here duplicates them.
+    //=========================================================================
+    cores_with_noc #(
+        .NUM_CORES(NUM_CORES)
+    ) noc_i (
+        .clk    (clk),
+        .resetn (resetn),
+
+        .core_spike_addr  (w_core_spike_addr),
+        .core_spike_valid (w_core_spike_valid),
+        .core_spike_ready (w_core_spike_ready),
+
+        .core_noc_relay_addr  (w_relay_addr),
+        .core_noc_relay_valid (w_relay_valid),
+        .core_noc_relay_full  (w_relay_full),
+
+        .host_spike_addr  (w_host_addr),
+        .host_spike_valid (w_host_valid),
+        .host_spike_ready (w_host_ready),
+
+        .route_cfg_valid (route_cfg_valid),
+        .route_cfg_core  (route_cfg_core),
+        .route_cfg_addr  (route_cfg_addr),
+        .route_cfg_data  (route_cfg_data),
+
+        .core_exec_run (w_exec_run)
+    );
+
+endmodule

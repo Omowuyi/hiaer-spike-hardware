@@ -1,0 +1,207 @@
+//=============================================================================
+// HiAER-Spike FireFly Package
+// Contains connection topology definitions and routing functions
+//
+// Server 0 Topology (from Firefly_connectivity.txt):
+//   Lower Tier (FPGA 0-3): Only Port 7, vertical links to upper tier
+//   Upper Tier (FPGA 4-7): All ports (4,5,6,7), full mesh
+//=============================================================================
+
+package hiaer_firefly_pkg;
+
+    //=========================================================================
+    // SYSTEM PARAMETERS
+    //=========================================================================
+    parameter int NUM_FPGAS             = 8;
+    parameter int NUM_PORTS             = 4;        // Ports 4,5,6,7
+    parameter int NUM_LANES_PER_PORT    = 4;        // 4 GT lanes per FireFly
+    parameter int AURORA_DATA_WIDTH     = 64;       // 64-bit Aurora data path
+    parameter int NUM_CORES_PER_FPGA    = 16;
+    // 8,192 per core is set by the synapse format: the 64-bit entry gives
+    // dest_addr[60:48], thirteen bits, to the postsynaptic neuron within a
+    // core.  The URAM can hold more, but no synapse can address it.
+    parameter int NEURONS_PER_CORE      = 8192;
+    // 16 x 8,192 = 2^17 exactly, which is why the spike address is seventeen
+    // bits and the routing table indexes it as addr[16:9].
+    parameter int NEURONS_PER_FPGA      = 131072;
+    
+    //=========================================================================
+    // TYPE DEFINITIONS
+    //=========================================================================
+    
+    typedef enum logic [2:0] {
+        FPGA_0 = 3'd0,
+        FPGA_1 = 3'd1,
+        FPGA_2 = 3'd2,
+        FPGA_3 = 3'd3,
+        FPGA_4 = 3'd4,
+        FPGA_5 = 3'd5,
+        FPGA_6 = 3'd6,
+        FPGA_7 = 3'd7
+    } fpga_id_t;
+    
+    typedef enum logic [1:0] {
+        PORT_4 = 2'd0,
+        PORT_5 = 2'd1,
+        PORT_6 = 2'd2,
+        PORT_7 = 2'd3
+    } port_id_t;
+    
+    // Connection entry: describes what a local port connects to
+    typedef struct packed {
+        logic [2:0]     remote_fpga;    // Which FPGA this port connects to
+        logic [1:0]     remote_port;    // Which port on the remote FPGA
+        logic           is_connected;   // 1 if this port is physically connected
+    } connection_entry_t;
+    
+    //=========================================================================
+    // CONNECTION TOPOLOGY LOOKUP TABLE
+    // Implements the exact topology from Firefly_connectivity.txt
+    //=========================================================================
+    
+    function automatic connection_entry_t get_connection(
+        input logic [2:0] local_fpga,
+        input logic [1:0] local_port
+    );
+        connection_entry_t result;
+        result.is_connected = 1'b0;
+        result.remote_fpga  = 3'd0;
+        result.remote_port  = 2'd0;
+        // Wiring per the CRI hardware manual section 5.9 and the FPGA wiring
+        // map: all eight boards use ports 4 to 7. Ports 4, 5 and 6 form an
+        // all-to-all group among the four boards on one CPU; port 7 crosses
+        // the chassis to the opposite group.
+        case (local_fpga)
+            3'd0: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd1, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd2, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd3, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd7, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd1: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd0, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd2, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd3, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd6, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd2: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd3, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd1, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd0, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd5, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd3: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd2, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd1, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd0, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd4, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd4: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd5, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd6, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd7, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd3, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd5: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd4, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd6, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd7, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd2, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd6: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd7, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd5, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd4, remote_port: PORT_5, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd1, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            3'd7: begin
+                case (local_port)
+                    PORT_4: result = '{remote_fpga: 3'd6, remote_port: PORT_4, is_connected: 1'b1};
+                    PORT_5: result = '{remote_fpga: 3'd5, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_6: result = '{remote_fpga: 3'd4, remote_port: PORT_6, is_connected: 1'b1};
+                    PORT_7: result = '{remote_fpga: 3'd0, remote_port: PORT_7, is_connected: 1'b1};
+                    default: ;
+                endcase
+            end
+            default: ;
+        endcase
+        return result;
+    endfunction
+    
+    //=========================================================================
+    // ROUTING FUNCTION - Find output port for destination FPGA
+    //=========================================================================
+    
+        //=========================================================================
+    // Next-hop selection.
+    //
+    // Every device has four ports: three to the other devices of its own CPU
+    // group and one across the chassis on port 7.  So a destination is either
+    // directly connected, or it is reachable through this device's port-7
+    // partner, which is itself directly connected to every device in the
+    // opposite group.  The longest path is therefore two hops, and no table
+    // lookup is required.
+    //=========================================================================
+    function automatic logic [1:0] get_output_port(
+        input logic [2:0] local_fpga,
+        input logic [2:0] dest_fpga
+    );
+        connection_entry_t c;
+        // directly connected on one of the four ports
+        for (int p = 0; p < 4; p++) begin
+            c = get_connection(local_fpga, p[1:0]);
+            if (c.is_connected && c.remote_fpga == dest_fpga)
+                return p[1:0];
+        end
+        // otherwise the destination is in the opposite group, and port 7
+        // reaches a device that is directly connected to it
+        return PORT_7;
+    endfunction
+    
+    //=========================================================================
+    // SPIKE PACKET FORMAT (64-bit, fits Aurora word)
+    //=========================================================================
+    
+    typedef struct packed {
+        logic [2:0]     opcode;         // [63:61]
+        logic [2:0]     dst_server;     // [60:58] For multi-server expansion
+        logic [2:0]     dst_fpga;       // [57:55]
+        logic [3:0]     dst_core;       // [54:51]
+        logic [18:0]    dst_neuron;     // [52:34]
+        logic [2:0]     src_fpga;       // [33:31]
+        logic [3:0]     src_core;       // [30:27]
+        logic [7:0]     timestamp;      // [26:19]
+        logic [2:0]     ttl;            // [18:16] Time-to-live
+        logic [13:0]    payload;        // [13:0]  Weight/flags, written and unread
+    } inter_fpga_spike_t;
+    
+    // Opcodes
+    localparam logic [2:0] OP_SPIKE   = 3'b000;
+    localparam logic [2:0] OP_SYNC    = 3'b001;
+    localparam logic [2:0] OP_CONFIG  = 3'b010;
+    localparam logic [2:0] OP_STATUS  = 3'b011;
+    localparam logic [2:0] OP_CREDIT  = 3'b100;
+    localparam logic [2:0] OP_NOP     = 3'b111;
+    
+endpackage : hiaer_firefly_pkg

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+NoC routing table generation and loading.
+
+TOPOLOGY (from noc_spike_router.sv / noc_l1_bus.sv / noc_l2_bus.sv)
+16 cores as 4 clusters of 4.  Core c sits in cluster c >> 2 at position c & 3.
+L1 moves a spike between cores inside one cluster; L2 moves it across clusters.
+
+TABLE
+1024 entries per core, indexed by spike_addr[18:9] -- so one entry governs a
+512-neuron block.  Each entry is 6 bits:
+
+    [5:4] level   NOP=0, LOCAL=1, L1=2, L2=3
+    [3:0] mask    L1: destination cores within the cluster
+                  L2: destination clusters
+
+The level is chosen per block from where that block's targets live:
+    targets only on the source core          -> LOCAL
+    targets only inside the source cluster   -> L1, mask = core positions
+    targets in other clusters                -> L2, mask = cluster bits
+    no targets                               -> NOP
+
+WIRE FORMAT (CMD 15, one entry per packet)
+    [511:504] = 15
+    [503:499] = core (tdest)
+    [ 15:  6] = addr
+    [  5:  0] = {level, mask}
+
+GRANULARITY CONSTRAINT -- worth knowing before partitioning
+Because the index is addr[18:9], routing is decided per 512-neuron block.  A
+block whose neurons are split across two cores cannot be expressed: the entry
+picks one destination set for all 512.  The partitioner must therefore assign
+neurons in 512-aligned granules, or accept that a split block multicasts to
+every core holding part of it.  check_alignment() reports violations.
+
+  from noc_routing import build_tables, load_tables, check_alignment
+  tables = build_tables(neuron_to_core, edges)
+  load_tables(tables)
+"""
+
+import numpy as np
+
+NUM_CORES = 16
+CLUSTER_SIZE = 4
+NUM_CLUSTERS = NUM_CORES // CLUSTER_SIZE
+BLOCK = 512                      # neurons per routing entry, from addr[18:9]
+ENTRIES = 1024
+CMD_ROUTE_TBL_W = 15
+
+OP_NOP, OP_LOCAL, OP_L1, OP_L2 = 0, 1, 2, 3
+LEVEL_NAME = {0: "NOP", 1: "LOCAL", 2: "L1", 3: "L2"}
+
+
+def cluster_of(core):
+    return core >> 2
+
+
+def position_in_cluster(core):
+    return core & 3
+
+
+def check_alignment(neuron_to_core):
+    """Report 512-neuron blocks whose neurons do not all live on one core.
+
+    Such a block cannot be routed precisely -- one table entry covers all 512.
+    Returns a list of (block_index, {cores}) for every violation.
+    """
+    blocks = {}
+    for n, c in neuron_to_core.items():
+        blocks.setdefault(n // BLOCK, set()).add(c)
+    return sorted((b, cs) for b, cs in blocks.items() if len(cs) > 1)
+
+
+def build_tables(neuron_to_core, edges):
+    """Build a routing table for every core.
+
+    neuron_to_core : {neuron_id: core_id}
+    edges          : iterable of (src_neuron, dst_neuron)
+
+    Returns {core: [ (level, mask) ] * 256}.
+    """
+    # which cores does each source core need to reach, per destination block?
+    need = {c: {} for c in range(NUM_CORES)}
+    for src, dst in edges:
+        sc = neuron_to_core.get(src)
+        dc = neuron_to_core.get(dst)
+        if sc is None or dc is None:
+            continue
+        need[sc].setdefault(dst // BLOCK, set()).add(dc)
+
+    tables = {}
+    for core in range(NUM_CORES):
+        tbl = [(OP_NOP, 0)] * ENTRIES
+        for blk, dests in need[core].items():
+            if blk >= ENTRIES:
+                raise ValueError("block %d exceeds the %d-entry table -- the "
+                                 "network is larger than the table can address"
+                                 % (blk, ENTRIES))
+            if dests == {core}:
+                tbl[blk] = (OP_LOCAL, 0)
+            elif all(cluster_of(d) == cluster_of(core) for d in dests):
+                mask = 0
+                for d in dests:
+                    mask |= 1 << position_in_cluster(d)
+                tbl[blk] = (OP_L1, mask)
+            else:
+                mask = 0
+                for d in dests:
+                    mask |= 1 << cluster_of(d)
+                tbl[blk] = (OP_L2, mask)
+        tables[core] = tbl
+    return tables
+
+
+def _packet(core, addr, level, mask):
+    cmd = np.zeros(64, dtype=np.uint64)
+    cmd[63] = CMD_ROUTE_TBL_W
+    # tdest = tdata[503:499]: five bits of core in the top of byte 62.
+    cmd[62] = (core & 0x1F) << 3
+    # The RTL reads [15:6] address, [5:0] data. No core field in the word.
+    val = ((addr & 0x3FF) << 6) | ((level & 0x3) << 4) | (mask & 0xF)
+    cmd[0] = val & 0xFF
+    cmd[1] = (val >> 8) & 0xFF
+    return cmd
+
+
+def load_tables(tables, skip_nop=True, verbose=True):
+    """Send every entry.  NOP entries match the reset value, so skipping them
+    cuts 4096 packets to only what the network actually needs."""
+    import hs_bridge.wrapped_dmadump.dmadump as d
+    sent = 0
+    for core in sorted(tables):
+        for addr, (level, mask) in enumerate(tables[core]):
+            if skip_nop and level == OP_NOP:
+                continue
+            d.dma_dump_write(_packet(core, addr, level, mask),
+                             64, 1, 0, 0, 0, d.DmaMethodNormal)
+            sent += 1
+    if verbose:
+        print("routing: %d entries sent across %d cores" % (sent, len(tables)))
+    return sent
+
+
+def describe(tables, limit=12):
+    """Print the non-NOP entries -- small enough to eyeball for a test network."""
+    for core in sorted(tables):
+        rows = [(a, l, m) for a, (l, m) in enumerate(tables[core]) if l != OP_NOP]
+        if not rows:
+            continue
+        print("core %-2d : %d entries" % (core, len(rows)))
+        for a, l, m in rows[:limit]:
+            print("    block %-3d (neurons %5d-%5d)  %-5s mask=%s"
+                  % (a, a * BLOCK, a * BLOCK + BLOCK - 1, LEVEL_NAME[l],
+                     format(m, "04b")))
+        if len(rows) > limit:
+            print("    ... %d more" % (len(rows) - limit))
+
+
+# ---------------------------------------------------------------- self-test
+if __name__ == "__main__":
+    # core 0 -> core 1 (same cluster) should be L1
+    # core 0 -> core 5 (cluster 1)    should be L2
+    n2c = {}
+    for c in range(NUM_CORES):
+        for n in range(c * BLOCK, (c + 1) * BLOCK):
+            n2c[n] = c
+    edges = [(0, BLOCK * 1 + 5),        # core 0 -> core 1, same cluster
+             (1, BLOCK * 5 + 7),        # core 0 -> core 5, cluster 1
+             (2, 3)]                    # core 0 -> core 0
+    t = build_tables(n2c, edges)
+    describe(t)
+    print()
+    bad = check_alignment(n2c)
+    print("alignment violations:", len(bad))
