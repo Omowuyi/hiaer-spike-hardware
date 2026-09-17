@@ -1,0 +1,267 @@
+`timescale 1ns / 1ps
+
+////////////////////////////////////////////////////////////////////////////////
+// DELAY BUFFER — BRAM-based circular buffer for per-synapse axonal delay
+//
+// Architecture:
+//   64 delay slots (indexed by 6-bit delay field).
+//   Each slot is a FIFO of pending synapse deliveries.
+//   BRAM stores {dest_addr[12:0], weight[15:0], src_addr[17:0], stdp_tag[3:0]} = 51 bits
+//   → padded to 54 bits for BRAM alignment (3 bits unused).
+//
+// Operation:
+//   1. HBM processor presents 64-bit synapse entries during Phase 2.
+//   2. delay==0: entry bypasses buffer via immediate_* outputs.
+//   3. delay>0: entry is written to slot[(current_slot + delay) % 64].
+//   4. At each timestep_tick: drain all entries from slot[current_slot],
+//      output them via delayed_* outputs, then advance current_slot.
+//   5. Phase 2 processes both immediate and delayed entries.
+//
+// BRAM organization:
+//   Single dual-port BRAM addressed as: {slot[5:0], entry_index[9:0]} = 16-bit addr
+//   Port A: write (new delayed synapses)
+//   Port B: read (drain current slot)
+//   Total depth: 64 * 1024 = 65536 entries × 54 bits
+//   BRAM36 usage: ceil(65536 * 54 / 36864) ≈ 96 BRAM36 per core
+//
+// Clock: aclk (IEP clock domain, 125-225 MHz)
+//
+// BACKWARD COMPATIBILITY:
+//   When all synapses have delay==0 (delta_mode=1 or legacy networks),
+//   all entries go through the immediate path. The delayed path is idle.
+//   No functional difference from the non-delay-buffer design.
+////////////////////////////////////////////////////////////////////////////////
+
+module delay_buffer #(
+    parameter MAX_DELAY         = 64,    // 6-bit delay field: 0-63
+    parameter ENTRIES_PER_SLOT  = 1024,  // max pending entries per delay slot
+    parameter ENTRY_WIDTH       = 54     // {3'b0, dest_addr[12:0], weight[15:0], src_addr[17:0], stdp_tag[3:0]}
+)(
+    input  wire        clk,
+    input  wire        resetn,
+
+    //=========================================================================
+    // Input: synapse entries from HBM processor (during Phase 2)
+    //=========================================================================
+    input  wire        syn_valid,       // HBM processor has a valid 64-bit entry
+    input  wire [12:0] syn_dest_addr,   // destination neuron address
+    input  wire signed [15:0] syn_weight, // synaptic weight
+    input  wire [5:0]  syn_delay,       // per-synapse delay (0-63)
+    input  wire [17:0] syn_src_addr,    // source neuron address (for STDP)
+    input  wire [3:0]  syn_stdp_tag,    // STDP rule index
+    output wire        syn_ready,       // backpressure to HBM processor
+
+    //=========================================================================
+    // Immediate output: delay==0 entries bypass the buffer entirely
+    //=========================================================================
+    output wire        immediate_valid,
+    output wire [12:0] immediate_dest_addr,
+    output wire signed [15:0] immediate_weight,
+    output wire [17:0] immediate_src_addr,
+    output wire [3:0]  immediate_stdp_tag,
+    input  wire        immediate_ready,
+
+    //=========================================================================
+    // Delayed output: entries from the current time slot, drained at start of Phase 2
+    //=========================================================================
+    output reg         delayed_valid,
+    output reg  [12:0] delayed_dest_addr,
+    output reg  signed [15:0] delayed_weight,
+    output reg  [17:0] delayed_src_addr,
+    output reg  [3:0]  delayed_stdp_tag,
+    input  wire        delayed_ready,
+
+    //=========================================================================
+    // Timestep control
+    //=========================================================================
+    input  wire        timestep_tick,   // pulse: advance to next timestep (start of Phase 2)
+    output wire        drain_done       // all entries from current slot have been drained
+);
+
+    //=========================================================================
+    // Internal state
+    //=========================================================================
+    reg [5:0] current_slot;              // current timestep mod 64
+
+    // Per-slot write and read pointers (registered in block RAM for count tracking)
+    // We use a simple dual-port approach: one counter array for write pointers,
+    // one for read pointers. Both are small enough for distributed RAM (64×10 = 640 bits).
+    reg [9:0] slot_wr_ptr [0:63];
+    reg [9:0] slot_rd_ptr [0:63];
+
+    // Drain state machine
+    localparam DRAIN_IDLE    = 2'd0;
+    localparam DRAIN_READ    = 2'd1;
+    localparam DRAIN_OUTPUT  = 2'd2;
+    localparam DRAIN_DONE    = 2'd3;
+
+    reg [1:0] drain_state;
+    reg [9:0] drain_rd_count;            // number of entries to drain from current slot
+    reg [9:0] drain_rd_idx;              // current read index within slot
+
+    //=========================================================================
+    // BRAM: stores delayed synapse entries
+    // Address = {slot[5:0], entry_index[9:0]}
+    // Port A: write (delayed synapse input)
+    // Port B: read (drain)
+    //=========================================================================
+    reg  [15:0] bram_addra;
+    reg  [ENTRY_WIDTH-1:0] bram_dina;
+    reg         bram_wea;
+    reg  [15:0] bram_addrb;
+    wire [ENTRY_WIDTH-1:0] bram_doutb;
+    reg         bram_enb;
+
+    // Inferred dual-port BRAM
+    (* ram_style = "block" *)
+    reg [ENTRY_WIDTH-1:0] delay_mem [0:(MAX_DELAY * ENTRIES_PER_SLOT) - 1];
+
+
+    // Port A: write
+    always @(posedge clk) begin
+        if (bram_wea)
+            delay_mem[bram_addra] <= bram_dina;
+    end
+
+    // Port B: read (1-cycle latency)
+    reg [ENTRY_WIDTH-1:0] bram_doutb_reg;
+    always @(posedge clk) begin
+        if (bram_enb)
+            bram_doutb_reg <= delay_mem[bram_addrb];
+    end
+    assign bram_doutb = bram_doutb_reg;
+
+    //=========================================================================
+    // Immediate bypass path: delay==0
+    //=========================================================================
+    wire syn_is_immediate = (syn_delay == 6'd0);
+
+    assign immediate_valid     = syn_valid & syn_is_immediate;
+    assign immediate_dest_addr = syn_dest_addr;
+    assign immediate_weight    = syn_weight;
+    assign immediate_src_addr  = syn_src_addr;
+    assign immediate_stdp_tag  = syn_stdp_tag;
+
+    // Backpressure: accept input if immediate path is ready (for delay=0)
+    // or if we can write to BRAM (for delay>0, always ready unless overflow)
+    assign syn_ready = syn_is_immediate ? immediate_ready : 1'b1;
+
+    //=========================================================================
+    // Write path: delay>0, write to target slot
+    //=========================================================================
+    wire [5:0] target_slot = current_slot + syn_delay;  // wraps naturally (6-bit)
+    wire       write_en    = syn_valid & ~syn_is_immediate & resetn;
+
+    always @(posedge clk) begin
+        bram_wea <= 1'b0;
+        if (~resetn) begin
+            // slot_wr_ptr cleared below
+        end else if (write_en) begin
+            bram_addra <= {target_slot, slot_wr_ptr[target_slot]};
+            bram_dina  <= {3'b0, syn_dest_addr, syn_weight, syn_src_addr, syn_stdp_tag};
+            bram_wea   <= 1'b1;
+        end
+    end
+
+    // Update write pointer
+    always @(posedge clk) begin
+        if (~resetn) begin : reset_wr_ptrs
+            integer s;
+            for (s = 0; s < MAX_DELAY; s = s + 1)
+                slot_wr_ptr[s] <= 10'd0;
+        end else if (write_en) begin
+            slot_wr_ptr[target_slot] <= slot_wr_ptr[target_slot] + 10'd1;
+        end else if (drain_state == DRAIN_DONE) begin
+            // After draining current_slot, reset its write pointer for reuse
+            slot_wr_ptr[current_slot] <= 10'd0;
+        end
+    end
+
+    //=========================================================================
+    // Drain state machine: reads all entries from slot[current_slot]
+    // Triggered by timestep_tick. Outputs entries via delayed_* interface.
+    //=========================================================================
+    assign drain_done = (drain_state == DRAIN_DONE) || (drain_state == DRAIN_IDLE);
+
+    always @(posedge clk) begin
+        if (~resetn) begin : reset_drain
+            integer s;
+            drain_state     <= DRAIN_IDLE;
+            drain_rd_count  <= 10'd0;
+            drain_rd_idx    <= 10'd0;
+            delayed_valid   <= 1'b0;
+            delayed_dest_addr <= 13'd0;
+            delayed_weight  <= 16'sd0;
+            delayed_src_addr <= 18'd0;
+            delayed_stdp_tag <= 4'd0;
+            current_slot    <= 6'd0;
+            bram_enb        <= 1'b0;
+            bram_addrb      <= 16'd0;
+            for (s = 0; s < MAX_DELAY; s = s + 1)
+                slot_rd_ptr[s] <= 10'd0;
+        end else begin
+            bram_enb <= 1'b0;
+
+            case (drain_state)
+                DRAIN_IDLE: begin
+                    delayed_valid <= 1'b0;
+                    if (timestep_tick) begin
+                        // Snapshot the write pointer as drain count
+                        drain_rd_count <= slot_wr_ptr[current_slot];
+                        drain_rd_idx   <= 10'd0;
+                        if (slot_wr_ptr[current_slot] == 10'd0) begin
+                            // Nothing to drain — skip to DONE immediately
+                            drain_state <= DRAIN_DONE;
+                        end else begin
+                            // Start reading first entry
+                            bram_addrb <= {current_slot, 10'd0};
+                            bram_enb   <= 1'b1;
+                            drain_state <= DRAIN_READ;
+                        end
+                    end
+                end
+
+                DRAIN_READ: begin
+                    // BRAM read latency = 1 cycle. Data available next cycle.
+                    drain_state <= DRAIN_OUTPUT;
+                end
+
+                DRAIN_OUTPUT: begin
+                    // Present BRAM output on delayed_* interface
+                    delayed_valid     <= 1'b1;
+                    delayed_dest_addr <= bram_doutb[50:38];   // [50:38] = dest_addr[12:0]
+                    delayed_weight    <= bram_doutb[37:22];   // [37:22] = weight[15:0]
+                    delayed_src_addr  <= bram_doutb[21:4];    // [21:4]  = src_addr[17:0]
+                    delayed_stdp_tag  <= bram_doutb[3:0];     // [3:0]   = stdp_tag[3:0]
+
+                    if (delayed_ready) begin
+                        delayed_valid <= 1'b0;
+                        drain_rd_idx <= drain_rd_idx + 10'd1;
+                        if (drain_rd_idx + 10'd1 >= drain_rd_count) begin
+                            // All entries drained
+                            drain_state <= DRAIN_DONE;
+                        end else begin
+                            // Read next entry
+                            bram_addrb <= {current_slot, drain_rd_idx + 10'd1};
+                            bram_enb   <= 1'b1;
+                            drain_state <= DRAIN_READ;
+                        end
+                    end
+                    // If !delayed_ready, hold output and wait
+                end
+
+                DRAIN_DONE: begin
+                    delayed_valid <= 1'b0;
+                    // Advance to next slot for next timestep
+                    current_slot <= current_slot + 6'd1;  // wraps at 64
+                    // Reset read pointer for the slot just drained
+                    slot_rd_ptr[current_slot] <= 10'd0;
+                    drain_state <= DRAIN_IDLE;
+                end
+
+                default: drain_state <= DRAIN_IDLE;
+            endcase
+        end
+    end
+
+endmodule

@@ -1,0 +1,2448 @@
+`timescale 1ns / 1ps
+
+////////////////////////////////////////////////////////////////////////////////////////
+// INTERNAL EVENTS PROCESSOR - NOISE BUG FIX
+////////////////////////////////////////////////////////////////////////////////////////
+// 
+// NOISE SHIFT FIX:
+//   Old behavior: shift=0 meant no noise, shift>17 meant left-shifted noise
+//   New behavior: shift=0 means unshifted noise, shift<0 (i.e., shift[5]=1) disables noise
+//                 shift=+15 means large noise (left shift by 15)
+//                 shift=-17 (6'b101111) means no noise
+//
+// shift_param is 6-bit signed:
+//   Positive values (0 to 31): left shift PRBS (larger noise)
+//   Negative values (-1 to -32): right shift PRBS (smaller noise)
+//   Values <= -17: effectively zero noise
+//
+////////////////////////////////////////////////////////////////////////////////////////
+
+module internal_events_processor(
+    input resetn,
+    input clk,
+    
+    // for debugging
+    input [16:0] num_outputs,
+    input signed [35:0] threshold,
+    
+    input            exec_run,
+    input            exec_bram_phase1_done,
+    output reg       exec_uram_phase1_ready,
+    input    [511:0] exec_hbm_rdata,
+    input            exec_hbm_rvalidready,
+    
+    output wire                 hbm2iep_rden,
+    
+    output reg [15:0] exec_uram_spiked,
+    output reg       exec_uram_phase0_done,
+    output reg       exec_uram_phase1_done,
+    output reg       exec_uram_phase2_done,
+    input            exec_hbm_rx_phase2_done,
+    
+    //=========================================================================
+    // STDP Phase 4: Spike address capture for stdp_controller
+    //=========================================================================
+    output reg [16:0] stdp_spike_addr,   // spiked neuron full address
+    output reg        stdp_spike_wr,     // write strobe (pulse per spike)
+    
+    //=========================================================================
+    // DELAY BUFFER: Per-synapse delay interface
+    // During Phase 2: entries with delay>0 are pushed to delay_buffer
+    // Before Phase 0: drained expired entries are accumulated into URAM
+    //=========================================================================
+    output reg        dbuf_syn_valid,     // push entry to delay buffer
+    output reg [12:0] dbuf_syn_dest,      // dest_addr from 64-bit entry
+    output reg signed [15:0] dbuf_syn_weight, // weight from 64-bit entry
+    output reg [5:0]  dbuf_syn_delay,     // delay from 64-bit entry
+    output reg [17:0] dbuf_syn_src,       // src_addr from 64-bit entry
+    output reg [3:0]  dbuf_syn_stdp_tag,  // stdp_tag from 64-bit entry
+    // FIX F: the URAM bank a delayed synapse targets.  In Phase 2 the target
+    // neuron is {dest_addr, group}, where group is WHICH of the 16 parallel
+    // extraction slots the entry came from -- it is implicit in the datapath
+    // and was never pushed into the delay buffer, so a drained entry could not
+    // be routed back to a bank.  Push it explicitly.
+    output reg [3:0]  dbuf_syn_group,
+    input  wire       dbuf_syn_ready,     // delay buffer ready
+    
+    // Delayed (drained) entries - accumulated before Phase 0
+    input  wire        dbuf_delayed_valid,
+    input  wire [12:0] dbuf_delayed_dest,
+    input  wire signed [15:0] dbuf_delayed_weight,
+    // DIAG: Phase 1 detected a spike at a URAM row >= 512, i.e. a neuron
+    // at or above 8192.  Sticky, cleared only by reset.
+    output reg         dbg_spike_hi,
+    input  wire [3:0]  dbuf_delayed_group,   // FIX I: bank for the drained entry
+    input  wire        dbuf_drain_done,
+    output reg         dbuf_delayed_ready,
+    input      [1:0] exec_neuron_model,
+    input      [5:0] leak,
+    input      [5:0] shift,
+    
+    //=========================================================================
+    // EXP_PSC: Biological neuron model configuration inputs (from CI CMD 13)
+    // delta_mode=1 (default): Legacy delta synapse mode - all behavior unchanged.
+    //                         All new code paths gated by !delta_mode are dead.
+    // delta_mode=0: Exponential PSC with dual tau_ex/tau_in, AdEx adaptation, STDP trace.
+    //              URAM Row B at offset +2048 stores I_ex, I_in, w, trace.
+    //              Phase 0 uses 4-cycle sub-state machine per neuron pair.
+    //              Phase 2 accumulates weights into I_ex/I_in instead of V.
+    //
+    // URAM Row B layout [35:0] per half-word (stored at rows 2048-4095):
+    //   [35:24] = I_ex  (12-bit signed excitatory current)
+    //   [23:12] = I_in  (12-bit signed inhibitory current)
+    //   [11:4]  = w     (8-bit unsigned adaptation current)
+    //   [3:0]   = trace (4-bit unsigned STDP eligibility trace)
+    //
+    // Phase 0 neuron model (delta_mode=0):
+    //   I_ex = (I_ex * decay_ex) >>> 12
+    //   I_in = (I_in * decay_in) >>> 12
+    //   w    = (w * decay_w) >> 8
+    //   V    = V - (V >> leak) + I_ex + I_in - w + noise
+    //   if V > threshold: spike=1, V=reset, w+=delta_w, trace=0xF, refrac=max
+    //   else: trace = max(trace-1, 0)
+    //
+    // Phase 2 weight accumulation (delta_mode=0):
+    //   if weight >= 0: I_ex += weight[11:0]
+    //   if weight <  0: I_in += weight[11:0]
+    //   (operates on Row B instead of Row A)
+    //=========================================================================
+    input             delta_mode,         // 1=legacy delta, 0=exp PSC
+    // FIX E: Phase-2 synapse entry width.
+    //   0 = 32-bit {op[2:0], dest[12:0], weight[15:0]} - 16 entries/word.
+    //       DEFAULT; bit-exact with the 42/42 + 7/7 bitstream.
+    //   1 = 64-bit {op, dest, weight, delay, syn_type, stdp_tag, src} -
+    //       8 entries/word, so 16 groups span TWO words selected by
+    //       phase2_halfsel.  Required for per-synapse delay and STDP.
+    input             syn_64bit_en,
+    input      [11:0] decay_ex,           // I_ex/g_ex decay factor (fixed-point x 4096)
+    input      [11:0] decay_in,           // I_in/g_in decay factor (fixed-point x 4096)
+    input      [7:0]  decay_w,            // Adaptation current decay (fixed-point x 256)
+    input      [7:0]  delta_w_param_in,   // Adaptation current increment on spike
+    //=========================================================================
+    // COBA: Conductance-based synapse mode inputs
+    // When coba_mode=0 (default): CUBA - I_ex/I_in added directly to V
+    // When coba_mode=1: COBA - g_ex/g_in multiplied by (E_rev - V) before driving V
+    //   synaptic_drive_ex = g_ex × (E_ex - V[11:0]) >>> 12
+    //   synaptic_drive_in = g_in × (E_in - V[11:0]) >>> 12
+    // Provides shunting inhibition (biologically realistic E/I balance).
+    // Only active when delta_mode=0. Ignored when delta_mode=1.
+    //=========================================================================
+    input             coba_mode,          // 0=CUBA, 1=COBA
+    input signed [11:0] E_ex,             // Excitatory reversal potential (12-bit signed)
+    input signed [11:0] E_in,             // Inhibitory reversal potential (12-bit signed)
+    //=========================================================================
+    // NEUROMODULATION: Per-core global modulatory signals
+    // neuromod_level: Scales STDP weight updates (0=no learning, 255=full rate)
+    //   Future use: delta_w_effective = (delta_w * neuromod_level) >>> 8
+    // neuromod_excitability_bias: Signed offset applied to threshold comparison
+    //   effective_threshold = threshold - neuromod_excitability_bias
+    //   Positive bias → lower threshold → easier to fire (ACh-like)
+    //   Negative bias → higher threshold → harder to fire
+    //=========================================================================
+    input      [7:0]  neuromod_level,              // STDP rate scale (0-255)
+    input signed [7:0] neuromod_excitability_bias,  // Threshold shift (signed)
+    
+    //=========================================================================
+    // STDP parameters (from CI CMD 13)
+    //=========================================================================
+    input             stdp_enable,                  // Enable STDP Phase 4
+    input      [7:0]  A_plus,                       // Potentiation magnitude
+    input      [7:0]  A_minus,                      // Depression magnitude
+    input signed [15:0] w_max,                      // Weight upper bound
+    input signed [15:0] w_min,                      // Weight lower bound
+    
+    input                      ci2iep_empty,
+    input          [1+17+35:0] ci2iep_dout,
+    output reg                 ci2iep_rden,
+    input                      iep2ci_full,
+    output reg       [17+35:0] iep2ci_din,
+    output reg                 iep2ci_wren,
+    
+    output reg [11:0]   uram_raddr_0,
+    output reg [11:0]   uram_raddr_1,
+    output reg [11:0]   uram_raddr_2,
+    output reg [11:0]   uram_raddr_3,
+    output reg [11:0]   uram_raddr_4,
+    output reg [11:0]   uram_raddr_5,
+    output reg [11:0]   uram_raddr_6,
+    output reg [11:0]   uram_raddr_7,
+    output reg [11:0]   uram_raddr_8,
+    output reg [11:0]   uram_raddr_9,
+    output reg [11:0]   uram_raddr_10,
+    output reg [11:0]   uram_raddr_11,
+    output reg [11:0]   uram_raddr_12,
+    output reg [11:0]   uram_raddr_13,
+    output reg [11:0]   uram_raddr_14,
+    output reg [11:0]   uram_raddr_15,
+    output reg          uram_rden_0,
+    output reg          uram_rden_1,
+    output reg          uram_rden_2,
+    output reg          uram_rden_3,
+    output reg          uram_rden_4,
+    output reg          uram_rden_5,
+    output reg          uram_rden_6,
+    output reg          uram_rden_7,
+    output reg          uram_rden_8,
+    output reg          uram_rden_9,
+    output reg          uram_rden_10,
+    output reg          uram_rden_11,
+    output reg          uram_rden_12,
+    output reg          uram_rden_13,
+    output reg          uram_rden_14,
+    output reg          uram_rden_15,
+    input [71:0] uram_rdata_0,
+    input [71:0] uram_rdata_1,
+    input [71:0] uram_rdata_2,
+    input [71:0] uram_rdata_3,
+    input [71:0] uram_rdata_4,
+    input [71:0] uram_rdata_5,
+    input [71:0] uram_rdata_6,
+    input [71:0] uram_rdata_7,
+    input [71:0] uram_rdata_8,
+    input [71:0] uram_rdata_9,
+    input [71:0] uram_rdata_10,
+    input [71:0] uram_rdata_11,
+    input [71:0] uram_rdata_12,
+    input [71:0] uram_rdata_13,
+    input [71:0] uram_rdata_14,
+    input [71:0] uram_rdata_15,
+    output [11:0]   uram_waddr_0,
+    output [11:0]   uram_waddr_1,
+    output [11:0]   uram_waddr_2,
+    output [11:0]   uram_waddr_3,
+    output [11:0]   uram_waddr_4,
+    output [11:0]   uram_waddr_5,
+    output [11:0]   uram_waddr_6,
+    output [11:0]   uram_waddr_7,
+    output [11:0]   uram_waddr_8,
+    output [11:0]   uram_waddr_9,
+    output [11:0]   uram_waddr_10,
+    output [11:0]   uram_waddr_11,
+    output [11:0]   uram_waddr_12,
+    output [11:0]   uram_waddr_13,
+    output [11:0]   uram_waddr_14,
+    output [11:0]   uram_waddr_15,
+    output [71:0]   uram_wdata_0,
+    output [71:0]   uram_wdata_1,
+    output [71:0]   uram_wdata_2,
+    output [71:0]   uram_wdata_3,
+    output [71:0]   uram_wdata_4,
+    output [71:0]   uram_wdata_5,
+    output [71:0]   uram_wdata_6,
+    output [71:0]   uram_wdata_7,
+    output [71:0]   uram_wdata_8,
+    output [71:0]   uram_wdata_9,
+    output [71:0]   uram_wdata_10,
+    output [71:0]   uram_wdata_11,
+    output [71:0]   uram_wdata_12,
+    output [71:0]   uram_wdata_13,
+    output [71:0]   uram_wdata_14,
+    output [71:0]   uram_wdata_15,
+    output          uram_wren_0,
+    output          uram_wren_1,
+    output          uram_wren_2,
+    output          uram_wren_3,
+    output          uram_wren_4,
+    output          uram_wren_5,
+    output          uram_wren_6,
+    output          uram_wren_7,
+    output          uram_wren_8,
+    output          uram_wren_9,
+    output          uram_wren_10,
+    output          uram_wren_11,
+    output          uram_wren_12,
+    output          uram_wren_13,
+    output          uram_wren_14,
+    output          uram_wren_15,
+    
+    output   [3:0]  iep_curr_state,
+    output   [12:0] curr_uram_waddr,
+    
+    output reg [3:0] rd_addr_neuron_param_mem,
+    input [83:0] dout_neuron_param_mem,
+    
+    // Watchdog and error outputs
+    output reg       iep_watchdog_error,
+    output reg       iep_uram_out_of_range
+);
+
+//////////////////
+// DECLARATIONS //
+//////////////////
+
+wire [12:0] URAM_ADDR_LIMIT;
+reg [3:0] microphase_ctr;
+wire [3:0] MICROPHASE_LIMIT;
+wire [8:0] MICROPHASE_MOD;
+wire [8:0] uram_microphase_addr_limit;
+wire  [3:0] SET_GROUP;
+wire [12:0] SET_ROW;
+
+reg [3:0] SET_GROUP_reg;
+reg [12:0] SET_ROW_reg;
+
+reg [12:0]  uram_raddr;
+reg         uram_rden;
+
+reg [12:0] uram_waddr [15:0];
+reg [11:0] uram_waddr_reg [15:0];  
+reg signed [71:0] uram_wdata_reg [15:0];
+reg  [15:0] uram_wren;
+
+reg uram_addr_rst, uram_addr_inc;
+
+reg [511:0] exec_hbm_rdata_reg;
+
+reg [11:0] uram_init_addr;
+reg        uram_init_done;
+reg        uram_init_wren;
+
+// URAM reinit: detect when a new network is loaded by monitoring num_outputs changes
+reg        uram_reinit_needed;
+reg        uram_reinit_active;  // distinguishes power-on init from reinit
+reg [16:0] num_outputs_prev;
+reg signed [35:0] threshold_prev;
+reg [1:0]  model_prev;
+reg [5:0]  shift_prev;
+reg [5:0]  leak_prev;
+
+//=========================================================================
+// 64-BIT SYNAPSE FORMAT: 8 entries per 512-bit FIFO word
+//
+// Each 64-bit entry:
+//   [63:61] = opcode (3 bits)
+//   [60:48] = dest_addr (13 bits)
+//   [47:32] = weight (16 bits signed)
+//   [31:26] = delay (6 bits)
+//   [25:22] = syn_type (4 bits, reserved)
+//   [21:18] = stdp_tag (4 bits)
+//   [17:0]  = src_addr (18 bits)
+//
+// 512-bit FIFO word layout:
+//   [511:448] = entry 7 (mapped to active_group + 7)
+//   [447:384] = entry 6
+//   ...
+//   [63:0]    = entry 0 (mapped to active_group + 0)
+//
+// Phase 2 half-select toggle (phase2_halfsel):
+//   halfsel=0: entries map to URAM groups 0-7
+//   halfsel=1: entries map to URAM groups 8-15
+//   Software packs consecutive FIFO words alternating 0-7, 8-15.
+//=========================================================================
+reg [63:0] exec_hbm_rdata_reg_arr_64[7:0];      // 8 × 64-bit raw entries
+reg signed [15:0] exec_hbm_rdata_reg_arr[15:0];  // 16 × 16-bit weights (8 active + 8 zeroed)
+wire signed [34:0] exec_hbm_rdata_reg_signext[15:0];
+
+reg phase2_halfsel;  // 0=groups 0-7, 1=groups 8-15
+
+reg [71:0] uram_wdata[15:0];
+
+assign uram_wdata_0 = uram_wdata[0];
+assign uram_wdata_1 = uram_wdata[1];
+assign uram_wdata_2 = uram_wdata[2];
+assign uram_wdata_3 = uram_wdata[3];
+assign uram_wdata_4 = uram_wdata[4];
+assign uram_wdata_5 = uram_wdata[5];
+assign uram_wdata_6 = uram_wdata[6];
+assign uram_wdata_7 = uram_wdata[7];
+assign uram_wdata_8 = uram_wdata[8];
+assign uram_wdata_9 = uram_wdata[9];
+assign uram_wdata_10 = uram_wdata[10];
+assign uram_wdata_11 = uram_wdata[11];
+assign uram_wdata_12 = uram_wdata[12];
+assign uram_wdata_13 = uram_wdata[13];
+assign uram_wdata_14 = uram_wdata[14];
+assign uram_wdata_15 = uram_wdata[15];
+
+// State machine
+reg [3:0] curr_state, next_state;
+localparam [3:0] STATE_RESET                 = 4'd0;
+localparam [3:0] STATE_IDLE                  = 4'd1;
+localparam [3:0] STATE_PHASE0_READ_SPIKES    = 4'd2;
+localparam [3:0] STATE_PHASE0_DONE           = 4'd3;
+localparam [3:0] STATE_PHASE0_DONE_WAIT      = 4'd4;
+localparam [3:0] STATE_FILL_PIPE_PHASE1      = 4'd5;
+localparam [3:0] STATE_WAIT_BRAM_PHASE1_DONE = 4'd6;
+localparam [3:0] STATE_PUSH_PTR_FIFO         = 4'd7;
+localparam [3:0] STATE_PHASE1_DONE           = 4'd8;
+localparam [3:0] STATE_POP_PTR_FIFO          = 4'd9;
+localparam [3:0] STATE_PHASE2_DONE           = 4'd10;
+localparam [3:0] STATE_READ_URAM_0           = 4'd11;
+localparam [3:0] STATE_READ_URAM_1           = 4'd12;
+localparam [3:0] STATE_WRITE_URAM            = 4'd13;
+localparam [3:0] STATE_WRITE_URAM_0          = 4'd14;
+localparam [3:0] STATE_INIT_URAM             = 4'd15;
+
+assign iep_curr_state = curr_state;
+
+// DIAG bit 12: did Phase 1 ever detect a spike above the first microphase?
+always @(posedge clk) begin
+    if (~resetn)
+        dbg_spike_hi <= 1'b0;
+    else if (curr_state == STATE_PUSH_PTR_FIFO && (|exec_uram_spiked) &&
+             uram_raddr >= 13'd512)
+        dbg_spike_hi <= 1'b1;
+end
+
+always @(posedge clk) begin
+    if (~resetn) curr_state <= STATE_RESET;
+    else         curr_state <= next_state;
+end
+
+//=========================================================================
+// IEP Watchdog Timer - detects hangs in any state
+// Resets on every state transition. Fires at 50M cycles (~111ms at 450MHz).
+// Also detects URAM address out of range.
+// These are internal regs - no new output ports required.
+//=========================================================================
+reg [25:0] watchdog_ctr;  // 26-bit: max 67M cycles
+localparam [25:0] WATCHDOG_LIMIT = 26'd50_000_000;
+reg [3:0] prev_state;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        watchdog_ctr <= 26'd0;
+        prev_state <= STATE_RESET;
+        iep_watchdog_error <= 1'b0;
+        iep_uram_out_of_range <= 1'b0;
+    end else begin
+        prev_state <= curr_state;
+        // Reset counter on any state transition or when idle
+        if (curr_state != prev_state || curr_state == STATE_IDLE) begin
+            watchdog_ctr <= 26'd0;
+        end else if (watchdog_ctr < WATCHDOG_LIMIT) begin
+            watchdog_ctr <= watchdog_ctr + 1'b1;
+        end else begin
+            iep_watchdog_error <= 1'b1;  // Sticky: latched until reset
+        end
+        // URAM address range check during phase0
+        if (!exec_uram_phase0_done && (uram_raddr > URAM_ADDR_LIMIT + 13'd2))
+            iep_uram_out_of_range <= 1'b1;
+    end
+end
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        uram_init_addr <= 12'd0;
+        uram_init_done <= 1'b0;
+        uram_reinit_needed <= 1'b0;
+        uram_reinit_active <= 1'b0;
+        num_outputs_prev <= 17'd0;
+        threshold_prev <= 36'd0;
+        model_prev <= 2'd0;
+        shift_prev <= 6'd0;
+        leak_prev <= 6'd0;
+    end else begin
+        // Detect ANY network parameter change → request URAM reinit
+        if (num_outputs != num_outputs_prev || threshold != threshold_prev ||
+            exec_neuron_model != model_prev || shift != shift_prev || leak != leak_prev) begin
+            num_outputs_prev <= num_outputs;
+            threshold_prev <= threshold;
+            model_prev <= exec_neuron_model;
+            shift_prev <= shift;
+            leak_prev <= leak;
+            uram_reinit_needed <= 1'b1;
+        end
+        
+        if (curr_state == STATE_RESET) begin
+            uram_init_addr <= 12'd0;
+            uram_init_done <= 1'b0;
+            uram_reinit_active <= 1'b0;
+        end else if (curr_state == STATE_IDLE && next_state == STATE_INIT_URAM) begin
+            // Entering INIT_URAM from IDLE (reinit path): reset init counter
+            uram_init_addr <= 12'd0;
+            uram_init_done <= 1'b0;
+            uram_reinit_active <= 1'b1;
+            uram_reinit_needed <= 1'b0;
+        end else if (curr_state == STATE_INIT_URAM) begin
+            if (uram_init_addr == 12'hFFF) begin
+                uram_init_done <= 1'b1;
+            end else begin
+                uram_init_addr <= uram_init_addr + 1'b1;
+            end
+        end else if (curr_state != STATE_INIT_URAM) begin
+            uram_reinit_active <= 1'b0;
+        end
+    end
+end
+
+genvar j;
+generate 
+    for (j=0; j<16;j=j+1) begin
+        assign exec_hbm_rdata_reg_signext[j] = (exec_hbm_rdata_reg_arr[j][15]) ? {19'h7FFFF, exec_hbm_rdata_reg_arr[j]} : {19'h00000, exec_hbm_rdata_reg_arr[j]};
+    end
+endgenerate
+
+//=========================================================================
+// EXP_PSC: Combinational decay computation (generate block)
+//
+// Row B fields extracted from uram_rmwdata via psc_saved_full_addr[0]:
+//   odd addr  -> upper half-word [71:36] is the active neuron's Row B
+//   even addr -> lower half-word [35:0]  is the active neuron's Row B
+//
+// Decay products are COMBINATIONAL. Valid only when uram_rmwdata holds Row B
+// data (psc_substate==2). At all other times they are don't-care.
+//
+// 12x13 signed multiply fits in DSP48 at 125 MHz (~2ns).
+// Total critical path: URAM mux -> bit extract -> multiply -> shift -> add ~ 4.5ns < 8ns.
+//=========================================================================
+genvar k;
+generate
+    for (k=0; k<16; k=k+1) begin : gen_decay_compute
+        // Select active half-word based on saved address LSB
+        wire [35:0] rowb_hw = psc_saved_full_addr[0] ? uram_rmwdata[k][71:36] : uram_rmwdata[k][35:0];
+        
+        // Extract Row B fields: [35:24]=I_ex, [23:12]=I_in, [11:4]=w, [3:0]=trace
+        wire signed [11:0] rowb_i_ex  = rowb_hw[35:24];
+        wire signed [11:0] rowb_i_in  = rowb_hw[23:12];
+        wire        [7:0]  rowb_w     = rowb_hw[11:4];
+        wire        [3:0]  rowb_trace = rowb_hw[3:0];
+        
+        // Decay multiplies (combinational, maps to DSP48)
+        wire signed [24:0] i_ex_prod = rowb_i_ex * $signed({1'b0, decay_ex});
+        wire signed [24:0] i_in_prod = rowb_i_in * $signed({1'b0, decay_in});
+        wire        [15:0] w_prod    = rowb_w * decay_w;
+        
+        // Truncated results (arithmetic right shift for signed, logical for unsigned)
+        // FIX 6: Use full 25-bit product with >>> for correct sign preservation
+        wire signed [11:0] i_ex_dec_wire = (i_ex_prod >>> 12);
+        wire signed [11:0] i_in_dec_wire = (i_in_prod >>> 12);
+        
+        assign psc_i_ex_decayed[k] = i_ex_dec_wire;
+        assign psc_i_in_decayed[k] = i_in_dec_wire;
+        assign psc_w_decayed[k]    = w_prod[15:8];       // >> 8 (unsigned, no sign issue)
+        assign psc_rowb_trace[k]   = rowb_trace;
+    end
+endgenerate
+
+//=========================================================================
+// PIPELINE REGISTERS: Break URAM→decay_DSP→COBA_DSP→neuron_model→URAM chain
+//
+// Decay outputs are registered at psc_substate==2. COBA and neuron model
+// consume the registered values at psc_substate==3. This splits the
+// 27-level combinational path into two ~13-level paths that each close
+// at 125 MHz.
+//=========================================================================
+reg signed [11:0] psc_i_ex_decayed_pipe [0:15];
+reg signed [11:0] psc_i_in_decayed_pipe [0:15];
+reg        [7:0]  psc_w_decayed_pipe    [0:15];
+reg        [3:0]  psc_trace_pipe        [0:15];
+
+//=========================================================================
+// COBA: Conductance-based synaptic drive computation (per group)
+//
+// In CUBA mode (coba_mode=0):
+//   drive_ex = sign_extend(I_ex_decayed)   [12-bit → 32-bit]
+//   drive_in = sign_extend(I_in_decayed)   [12-bit → 32-bit]
+//   Direct current injection into V, independent of V's value.
+//
+// In COBA mode (coba_mode=1):
+//   drive_ex = (g_ex_decayed × (E_ex - V_trunc)) >>> 12   [conductance × driving force]
+//   drive_in = (g_in_decayed × (E_in - V_trunc)) >>> 12
+//   V_trunc = lower 12 bits of V. Provides shunting inhibition: as V approaches
+//   E_ex (~0mV), excitatory drive weakens. As V approaches E_in (~-80mV),
+//   inhibitory drive weakens. This self-regulation prevents runaway excitation
+//   and is biologically critical for cortical travelling waves.
+//
+// Separate drives for upper and lower half-word neurons (different V values).
+// Maps to DSP48E2 slices: 4 multiplies × 16 groups = 64 DSP48E2s max.
+//=========================================================================
+genvar coba_k;
+generate
+    for (coba_k = 0; coba_k < 16; coba_k = coba_k + 1) begin : gen_coba_drive
+        //--- Upper half-word neuron: V is in row_a_latched[coba_k][67:36] ---
+        wire signed [11:0] v_trunc_upper = row_a_latched[coba_k][47:36]; // V[11:0]
+        wire signed [23:0] coba_ex_prod_upper = psc_i_ex_decayed_pipe[coba_k] * (E_ex - v_trunc_upper);
+        wire signed [23:0] coba_in_prod_upper = psc_i_in_decayed_pipe[coba_k] * (E_in - v_trunc_upper);
+        
+        //--- Lower half-word neuron: V is in row_a_latched[coba_k][31:0] ---
+        wire signed [11:0] v_trunc_lower = row_a_latched[coba_k][11:0];  // V[11:0]
+        wire signed [23:0] coba_ex_prod_lower = psc_i_ex_decayed_pipe[coba_k] * (E_ex - v_trunc_lower);
+        wire signed [23:0] coba_in_prod_lower = psc_i_in_decayed_pipe[coba_k] * (E_in - v_trunc_lower);
+        
+        //--- CUBA/COBA mux: select based on coba_mode ---
+        // CUBA: direct sign-extension of I_ex/I_in to 32 bits
+        // COBA: g × (E-V) product arithmetically right-shifted by 12
+        wire signed [31:0] drive_ex_upper = coba_mode ? 
+            (coba_ex_prod_upper >>> 12) :
+            {{20{psc_i_ex_decayed_pipe[coba_k][11]}}, psc_i_ex_decayed_pipe[coba_k]};
+        wire signed [31:0] drive_in_upper = coba_mode ?
+            (coba_in_prod_upper >>> 12) :
+            {{20{psc_i_in_decayed_pipe[coba_k][11]}}, psc_i_in_decayed_pipe[coba_k]};
+        wire signed [31:0] drive_ex_lower = coba_mode ?
+            (coba_ex_prod_lower >>> 12) :
+            {{20{psc_i_ex_decayed_pipe[coba_k][11]}}, psc_i_ex_decayed_pipe[coba_k]};
+        wire signed [31:0] drive_in_lower = coba_mode ?
+            (coba_in_prod_lower >>> 12) :
+            {{20{psc_i_in_decayed_pipe[coba_k][11]}}, psc_i_in_decayed_pipe[coba_k]};
+    end
+endgenerate
+
+//=========================================================================
+// COBA: Intermediate wire arrays for procedural access
+// Generate block outputs cannot be indexed by procedural variables (i).
+// These arrays capture the generate block outputs for use in always @(*).
+//=========================================================================
+wire signed [31:0] coba_drive_ex_upper [0:15];
+wire signed [31:0] coba_drive_in_upper [0:15];
+wire signed [31:0] coba_drive_ex_lower [0:15];
+wire signed [31:0] coba_drive_in_lower [0:15];
+genvar coba_w;
+generate
+    for (coba_w = 0; coba_w < 16; coba_w = coba_w + 1) begin : gen_coba_wire
+        assign coba_drive_ex_upper[coba_w] = gen_coba_drive[coba_w].drive_ex_upper;
+        assign coba_drive_in_upper[coba_w] = gen_coba_drive[coba_w].drive_in_upper;
+        assign coba_drive_ex_lower[coba_w] = gen_coba_drive[coba_w].drive_ex_lower;
+        assign coba_drive_in_lower[coba_w] = gen_coba_drive[coba_w].drive_in_lower;
+    end
+endgenerate
+//
+// effective_threshold = threshold_param - neuromod_excitability_bias
+//
+// Positive neuromod_excitability_bias → LOWER effective threshold → easier to fire
+//   (models cholinergic/noradrenergic arousal increasing cortical excitability)
+// Negative neuromod_excitability_bias → HIGHER effective threshold → harder to fire
+//   (models GABAergic suppression of cortical activity)
+// Zero bias (default) → threshold unchanged
+//
+// Note: neuromod_level (STDP rate modulation) will be used in future weight
+// update mechanism: delta_w_effective = (delta_w * neuromod_level) >>> 8.
+// Currently stored but not applied until STDP weight write-back is implemented.
+//=========================================================================
+wire signed [31:0] effective_threshold = threshold_param[31:0] 
+    - {{24{neuromod_excitability_bias[7]}}, neuromod_excitability_bias};
+
+//=========================================================================
+// EXP_PSC: Sub-state sequential logic with DECAY PIPELINE
+//
+// Timing (delta_mode=0 Phase 0):
+//   Cycle N   (sub 0): Issue Row A read. Save psc_saved_full_addr.
+//   Cycle N+1 (sub 1): Row A arrives. Latch row_a_latched. Issue Row B read.
+//   Cycle N+2 (sub 2): Row B arrives. Decay DSPs compute. Register decay outputs.
+//   Cycle N+3 (sub 3): Pipelined decay → COBA → neuron model. Write Row A.
+//                       Latch new_row_b.
+//   Cycle N+4 (sub 4): Write Row B. Advance address.
+//
+// Sub 0 only advances when uram_rden is asserted (handles neuron_param_mem waits).
+//=========================================================================
+integer psc_idx;
+always @(posedge clk) begin
+    if (~resetn || curr_state != STATE_PHASE0_READ_SPIKES || delta_mode) begin
+        psc_substate <= 3'd0;
+        psc_saved_full_addr <= 13'd0;
+        psc_suppress_wren <= 1'b0;
+        psc_manual_wren <= 1'b0;
+        for (psc_idx = 0; psc_idx < NEURON_GROUPS; psc_idx = psc_idx + 1) begin
+            row_a_latched[psc_idx] <= 72'd0;
+            new_row_b[psc_idx] <= 72'd0;
+            psc_i_ex_decayed_pipe[psc_idx] <= 12'sd0;
+            psc_i_in_decayed_pipe[psc_idx] <= 12'sd0;
+            psc_w_decayed_pipe[psc_idx] <= 8'd0;
+            psc_trace_pipe[psc_idx] <= 4'd0;
+        end
+    end else begin
+        case (psc_substate)
+            3'd0: begin
+                if (uram_rden) begin
+                    psc_substate <= 3'd1;
+                    // FIX B: uram_waddr[0] still holds the PREVIOUS iteration's
+                    // Row B address (latched at its sub 1), so from iteration 1
+                    // onward this saved addr+4096, sending psc_waddr_row_a into
+                    // the Row B region and wrapping psc_waddr_row_b back into
+                    // Row A.  Capture the address actually being read.
+                    psc_saved_full_addr <= uram_raddr_0_full;
+                    psc_suppress_wren <= 1'b1;
+                    psc_manual_wren <= 1'b0;
+                end
+            end
+            3'd1: begin
+                // Row A data in uram_rmwdata - latch it
+                psc_substate <= 3'd2;
+                psc_suppress_wren <= 1'b1;  // Suppress during sub 2 (pipeline stage)
+                psc_manual_wren <= 1'b0;
+                for (psc_idx = 0; psc_idx < NEURON_GROUPS; psc_idx = psc_idx + 1)
+                    row_a_latched[psc_idx] <= uram_rmwdata[psc_idx];
+            end
+            3'd2: begin
+                // Row B in uram_rmwdata. Decay DSPs compute. Register outputs.
+                psc_substate <= 3'd3;
+                psc_suppress_wren <= 1'b0;
+                psc_manual_wren <= 1'b1;    // Enable write for sub 3 (Row A write)
+                for (psc_idx = 0; psc_idx < NEURON_GROUPS; psc_idx = psc_idx + 1) begin
+                    psc_i_ex_decayed_pipe[psc_idx] <= psc_i_ex_decayed[psc_idx];
+                    psc_i_in_decayed_pipe[psc_idx] <= psc_i_in_decayed[psc_idx];
+                    psc_w_decayed_pipe[psc_idx] <= psc_w_decayed[psc_idx];
+                    psc_trace_pipe[psc_idx] <= psc_rowb_trace[psc_idx];
+                end
+            end
+            3'd3: begin
+                // Pipelined: reg decay → COBA DSP → neuron model → uram_wdata
+                // Row A write happens. Latch new Row B for sub 4.
+                psc_substate <= 3'd4;
+                psc_suppress_wren <= 1'b0;
+                psc_manual_wren <= 1'b1;    // Keep for sub 4 (Row B write)
+                for (psc_idx = 0; psc_idx < NEURON_GROUPS; psc_idx = psc_idx + 1)
+                    new_row_b[psc_idx] <= psc_new_row_b_comb[psc_idx];
+            end
+            3'd4: begin
+                // Row B write. Advance address.
+                psc_substate <= 3'd0;
+                psc_suppress_wren <= 1'b0;
+                psc_manual_wren <= 1'b0;
+            end
+            default: psc_substate <= 3'd0;
+        endcase
+    end
+end
+
+// Phase 0 address counter - ISOLATED always block, no shared reset with main FSM
+(* dont_touch = "true" *) reg [12:0] psc_addr_counter_iso;
+always @(posedge clk) begin
+    if (~resetn)
+        psc_addr_counter_iso <= 13'd0;
+    else if (curr_state != STATE_PHASE0_READ_SPIKES)
+        psc_addr_counter_iso <= 13'd0;
+    else if (!delta_mode && psc_substate == 3'd4)
+        psc_addr_counter_iso <= psc_addr_counter_iso + 13'd1;
+end
+
+// IEP Phase 1/2 no-fire bypass timeout
+(* dont_touch = "true" *) reg [10:0] iep_phase1_timeout;
+always @(posedge clk) begin
+    if (~resetn || curr_state == STATE_IDLE || curr_state == STATE_PHASE0_READ_SPIKES)
+        iep_phase1_timeout <= 11'd0;
+    else if (!delta_mode && curr_state == STATE_WAIT_BRAM_PHASE1_DONE)
+        iep_phase1_timeout <= (iep_phase1_timeout < 11'd2047) ? iep_phase1_timeout + 11'd1 : iep_phase1_timeout;
+    else if (!delta_mode && (curr_state == STATE_PUSH_PTR_FIFO || curr_state == STATE_POP_PTR_FIFO) && !exec_hbm_rvalidready)
+        iep_phase1_timeout <= (iep_phase1_timeout < 11'd2047) ? iep_phase1_timeout + 11'd1 : iep_phase1_timeout;
+    else if (!delta_mode && (curr_state == STATE_PUSH_PTR_FIFO || curr_state == STATE_POP_PTR_FIFO) && exec_hbm_rvalidready)
+        iep_phase1_timeout <= 11'd0;
+    else
+        iep_phase1_timeout <= 11'd0;
+end
+
+reg exec_hbm_rvalidready_reg, exec_hbm_rvalidready_reg2;
+
+reg [12:0]   uram_raddr_0_full;
+reg [12:0]   uram_raddr_1_full;
+reg [12:0]   uram_raddr_2_full;
+reg [12:0]   uram_raddr_3_full;
+reg [12:0]   uram_raddr_4_full;
+reg [12:0]   uram_raddr_5_full;
+reg [12:0]   uram_raddr_6_full;
+reg [12:0]   uram_raddr_7_full;
+reg [12:0]   uram_raddr_8_full;
+reg [12:0]   uram_raddr_9_full;
+reg [12:0]   uram_raddr_10_full;
+reg [12:0]   uram_raddr_11_full;
+reg [12:0]   uram_raddr_12_full;
+reg [12:0]   uram_raddr_13_full;
+reg [12:0]   uram_raddr_14_full;
+reg [12:0]   uram_raddr_15_full;
+
+reg [12:0]   uram_raddr_0_full_reg;
+reg [12:0]   uram_raddr_1_full_reg;
+reg [12:0]   uram_raddr_2_full_reg;
+reg [12:0]   uram_raddr_3_full_reg;
+reg [12:0]   uram_raddr_4_full_reg;
+reg [12:0]   uram_raddr_5_full_reg;
+reg [12:0]   uram_raddr_6_full_reg;
+reg [12:0]   uram_raddr_7_full_reg;
+reg [12:0]   uram_raddr_8_full_reg;
+reg [12:0]   uram_raddr_9_full_reg;
+reg [12:0]   uram_raddr_10_full_reg;
+reg [12:0]   uram_raddr_11_full_reg;
+reg [12:0]   uram_raddr_12_full_reg;
+reg [12:0]   uram_raddr_13_full_reg;
+reg [12:0]   uram_raddr_14_full_reg;
+reg [12:0]   uram_raddr_15_full_reg;
+
+reg signed [35:0] threshold_param;
+reg      [1:0] exec_neuron_model_param;
+reg      [5:0] leak_param;
+reg signed [5:0] shift_param;  // CHANGED: Now signed for proper negative handling
+// Feature 6: Refractory period - per-layer max loaded into per-neuron URAM counter on spike
+reg      [2:0] refractory_max_param;
+// Feature 1e: Synaptic delay - per-layer delay value for group B (delayed) synapses
+reg      [3:0] delay_value_param;
+// Feature 1e: Dual synapse enable - per-layer flag
+reg            dual_synapse_en_param;
+// Soft reset mode - per-layer: 0=hard reset (MP=0), 1=soft reset (MP=MP-threshold)
+reg            soft_reset_en_param;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        threshold_param <= threshold;
+        exec_neuron_model_param <= exec_neuron_model;
+        leak_param <= leak;
+        shift_param <= shift;
+        refractory_max_param <= 3'd0;
+        delay_value_param <= 4'd0;
+        dual_synapse_en_param <= 1'b0;
+        soft_reset_en_param <= 1'b0;
+    end else begin
+        threshold_param <= dout_neuron_param_mem[69:34];
+        exec_neuron_model_param <= dout_neuron_param_mem[71:70];
+        shift_param <= dout_neuron_param_mem[77:72];
+        leak_param <= dout_neuron_param_mem[83:78];
+        // New fields from neuron_param_mem [20:0]
+        delay_value_param <= dout_neuron_param_mem[20:17];
+        refractory_max_param <= dout_neuron_param_mem[16:14];
+        dual_synapse_en_param <= dout_neuron_param_mem[13];
+        soft_reset_en_param <= dout_neuron_param_mem[8];
+    end
+end
+
+parameter NEURON_GROUPS=16;
+
+//=========================================================================
+// EXP_PSC: Row B constants, sub-state machine, and computation registers
+//=========================================================================
+// Row B full_addr = Row A full_addr + ROW_B_FULL_OFFSET
+//   (Adding 4096 to 13-bit full_addr adds 2048 to bits [12:1] = URAM row)
+//
+// Sub-state machine (Phase 0, delta_mode=0 only):
+//   0: Issue Row A read at uram_raddr
+//   1: Row A data arrives -> latch. Issue Row B read (raddr + 4096). Suppress write.
+//   2: Row B data arrives. Compute new V + Row B. Write Row A at saved addr.
+//   3: Write Row B at saved addr + 4096. Advance address counter.
+//=========================================================================
+
+localparam [12:0] ROW_B_FULL_OFFSET = 13'd4096;
+localparam [11:0] ROW_B_ROW_OFFSET = 12'd2048;  // ROW_B_FULL_OFFSET / 2 (row addr = full_addr[12:1])
+
+//=========================================================================
+// FIX C: Phase-2 synapse entries are 32-bit {op[2:0], dest[12:0], weight[15:0]}
+// -- the only format fpga_compiler.create_synapses (and every other compiler
+// path) emits.  exp_psc therefore uses the SAME extraction as delta mode and
+// differs only by targeting Row B.  phase2_halfsel is retired: the 64-bit
+// half-select scheme has no software producer, and toggling it per FIFO word
+// mis-routes every word after the first in a multi-pointer Phase 2.
+//=========================================================================
+wire [12:0] phase2_row_offset = delta_mode ? 13'd0 : ROW_B_FULL_OFFSET;
+
+//=========================================================================
+// FIX D: signedness.  The threshold comparison and the leak term were both
+// evaluated UNSIGNED -- part-selects are unsigned in Verilog, and $unsigned()
+// or a concatenation anywhere in an expression makes the WHOLE expression
+// unsigned.  Measured consequences on hardware:
+//   * a neuron driven negative (pure inhibition) compared as ~4.29e9 > thr,
+//     fired spuriously every timestep and reset V to 0
+//   * a neuron with a NEGATIVE threshold compared against 0xFFFFFFFF and
+//     could never fire at all
+//   * leak on a negative V subtracted a huge positive number instead of
+//     decaying toward zero
+// The leak term also clamps the shift amount: an arithmetic shift of a
+// negative value by >= the operand width yields -1, not 0, so leak_param
+// values of 32..63 (the "no leak" convention) must be forced to 0.
+//=========================================================================
+wire signed [31:0] leak_term_upper [0:15];
+wire signed [31:0] leak_term_lower [0:15];
+wire signed [31:0] psc_leak_term_u [0:15];
+wire signed [31:0] psc_leak_term_l [0:15];
+genvar lt;
+generate
+    for (lt=0; lt<16; lt=lt+1) begin : gen_leak_terms
+        assign leak_term_upper[lt] = (leak_param >= 6'd32) ? 32'sd0 :
+                     ($signed(uram_rmwmem_upper[lt][31:0]) >>> leak_param);
+        assign leak_term_lower[lt] = (leak_param >= 6'd32) ? 32'sd0 :
+                     ($signed(uram_rmwmem_lower[lt][31:0]) >>> leak_param);
+        assign psc_leak_term_u[lt] = (leak_param >= 6'd32) ? 32'sd0 :
+                     ($signed(row_a_latched[lt][67:36]) >>> leak_param);
+        assign psc_leak_term_l[lt] = (leak_param >= 6'd32) ? 32'sd0 :
+                     ($signed(row_a_latched[lt][31:0]) >>> leak_param);
+    end
+endgenerate
+
+// Sub-state counter
+reg [2:0] psc_substate;
+
+// Saved Row A address (captured at sub 0)
+reg [12:0] psc_saved_full_addr;
+
+// Latched Row A data (captured at sub 1)
+reg [71:0] row_a_latched [NEURON_GROUPS-1:0];
+
+// Registered Row B output (computed at sub 2, written at sub 3)
+reg [71:0] new_row_b [NEURON_GROUPS-1:0];
+
+// Combinational Row B output (side-channel from uram_wdata block at sub 2)
+reg [71:0] psc_new_row_b_comb [NEURON_GROUPS-1:0];
+
+// Decay computation results (driven by generate block, valid at sub 2)
+wire signed [11:0] psc_i_ex_decayed [NEURON_GROUPS-1:0];
+wire signed [11:0] psc_i_in_decayed [NEURON_GROUPS-1:0];
+wire        [7:0]  psc_w_decayed    [NEURON_GROUPS-1:0];
+wire        [3:0]  psc_rowb_trace   [NEURON_GROUPS-1:0];
+
+// Manual write control
+reg psc_manual_wren;    // Force URAM write at subs 2,3
+reg psc_suppress_wren;  // Suppress automatic write at sub 1
+
+// Effective address limit (clamped for delta_mode=0)
+wire [12:0] URAM_ADDR_LIMIT_EFF;
+assign URAM_ADDR_LIMIT_EFF = delta_mode ? URAM_ADDR_LIMIT :
+                             (URAM_ADDR_LIMIT <= 13'd4095) ? URAM_ADDR_LIMIT : 13'd4095;
+
+reg [71:0] uram_rmwdata[NEURON_GROUPS-1:0]; 
+reg [35:0] uram_rmwdata_upper[NEURON_GROUPS-1:0]; 
+reg [35:0] uram_rmwdata_lower[NEURON_GROUPS-1:0]; 
+
+reg signed [34:0] uram_rmwmem_upper[NEURON_GROUPS-1:0]; 
+reg signed [34:0] uram_rmwmem_lower[NEURON_GROUPS-1:0];
+// Feature 6: Per-neuron refractory counters extracted from URAM half-word [34:32]
+reg [2:0] refrac_ctr_upper[NEURON_GROUPS-1:0];
+reg [2:0] refrac_ctr_lower[NEURON_GROUPS-1:0];
+
+reg uram_wren_0_reg;
+reg uram_wren_1_reg;
+reg uram_wren_2_reg;
+reg uram_wren_3_reg;
+reg uram_wren_4_reg;
+reg uram_wren_5_reg;
+reg uram_wren_6_reg;
+reg uram_wren_7_reg;
+reg uram_wren_8_reg;
+reg uram_wren_9_reg;
+reg uram_wren_10_reg;
+reg uram_wren_11_reg;
+reg uram_wren_12_reg;
+reg uram_wren_13_reg;
+reg uram_wren_14_reg;
+reg uram_wren_15_reg;
+
+integer i;
+always @(*) begin
+    for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+        uram_rmwdata_upper[i] = uram_rmwdata[i][71:36];
+        uram_rmwdata_lower[i] = uram_rmwdata[i][35:0];
+        // URAM half-word layout: [35]=spike, [34:32]=refractory_counter, [31:0]=MP
+        // uram_rmwmem extracts the full [34:0] for backward-compatible use in phase1/phase2
+        // where only the spike bit [35] and accumulated MP matter.
+        uram_rmwmem_upper[i] = uram_rmwdata_upper[i][34:0];
+        uram_rmwmem_lower[i] = uram_rmwdata_lower[i][34:0];
+        // Feature 6: Extract per-neuron refractory counters
+        refrac_ctr_upper[i] = uram_rmwdata_upper[i][34:32];
+        refrac_ctr_lower[i] = uram_rmwdata_lower[i][34:32];
+    end
+end
+
+always @(*) begin
+    if ((curr_state==STATE_WRITE_URAM) || (curr_state==STATE_WRITE_URAM_0) || (curr_state==STATE_READ_URAM_0) || (curr_state==STATE_READ_URAM_1)) begin
+        uram_rmwdata[0] = ((uram_waddr_0==uram_waddr_reg[0]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_0 && uram_wren_0_reg)?uram_wdata_reg[0]:uram_rdata_0;
+        uram_rmwdata[1] = ((uram_waddr_1==uram_waddr_reg[1]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_1 && uram_wren_1_reg)?uram_wdata_reg[1]:uram_rdata_1;
+        uram_rmwdata[2] = ((uram_waddr_2==uram_waddr_reg[2]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_2 && uram_wren_2_reg)?uram_wdata_reg[2]:uram_rdata_2;
+        uram_rmwdata[3] = ((uram_waddr_3==uram_waddr_reg[3]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_3 && uram_wren_3_reg)?uram_wdata_reg[3]:uram_rdata_3;
+        uram_rmwdata[4] = ((uram_waddr_4==uram_waddr_reg[4]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_4 && uram_wren_4_reg)?uram_wdata_reg[4]:uram_rdata_4;
+        uram_rmwdata[5] = ((uram_waddr_5==uram_waddr_reg[5]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_5 && uram_wren_5_reg)?uram_wdata_reg[5]:uram_rdata_5;
+        uram_rmwdata[6] = ((uram_waddr_6==uram_waddr_reg[6]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_6 && uram_wren_6_reg)?uram_wdata_reg[6]:uram_rdata_6;
+        uram_rmwdata[7] = ((uram_waddr_7==uram_waddr_reg[7]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_7 && uram_wren_7_reg)?uram_wdata_reg[7]:uram_rdata_7;
+        uram_rmwdata[8] = ((uram_waddr_8==uram_waddr_reg[8]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_8 && uram_wren_8_reg)?uram_wdata_reg[8]:uram_rdata_8;
+        uram_rmwdata[9] = ((uram_waddr_9==uram_waddr_reg[9]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_9 && uram_wren_9_reg)?uram_wdata_reg[9]:uram_rdata_9;
+        uram_rmwdata[10] = ((uram_waddr_10==uram_waddr_reg[10]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_10 && uram_wren_10_reg)?uram_wdata_reg[10]:uram_rdata_10;
+        uram_rmwdata[11] = ((uram_waddr_11==uram_waddr_reg[11]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_11 && uram_wren_11_reg)?uram_wdata_reg[11]:uram_rdata_11;
+        uram_rmwdata[12] = ((uram_waddr_12==uram_waddr_reg[12]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_12 && uram_wren_12_reg)?uram_wdata_reg[12]:uram_rdata_12;
+        uram_rmwdata[13] = ((uram_waddr_13==uram_waddr_reg[13]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_13 && uram_wren_13_reg)?uram_wdata_reg[13]:uram_rdata_13;
+        uram_rmwdata[14] = ((uram_waddr_14==uram_waddr_reg[14]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_14 && uram_wren_14_reg)?uram_wdata_reg[14]:uram_rdata_14;
+        uram_rmwdata[15] = ((uram_waddr_15==uram_waddr_reg[15]) && (SET_GROUP == SET_GROUP_reg) && uram_wren_15 && uram_wren_15_reg)?uram_wdata_reg[15]:uram_rdata_15;
+    end
+    else begin
+        uram_rmwdata[0] = ((uram_waddr_0==uram_waddr_reg[0]) && uram_wren_0 && uram_wren_0_reg)?uram_wdata_reg[0]:uram_rdata_0;
+        uram_rmwdata[1] = ((uram_waddr_1==uram_waddr_reg[1]) && uram_wren_1 && uram_wren_1_reg)?uram_wdata_reg[1]:uram_rdata_1;
+        uram_rmwdata[2] = ((uram_waddr_2==uram_waddr_reg[2]) && uram_wren_2 && uram_wren_2_reg)?uram_wdata_reg[2]:uram_rdata_2;
+        uram_rmwdata[3] = ((uram_waddr_3==uram_waddr_reg[3]) && uram_wren_3 && uram_wren_3_reg)?uram_wdata_reg[3]:uram_rdata_3;
+        uram_rmwdata[4] = ((uram_waddr_4==uram_waddr_reg[4]) && uram_wren_4 && uram_wren_4_reg)?uram_wdata_reg[4]:uram_rdata_4;
+        uram_rmwdata[5] = ((uram_waddr_5==uram_waddr_reg[5]) && uram_wren_5 && uram_wren_5_reg)?uram_wdata_reg[5]:uram_rdata_5;
+        uram_rmwdata[6] = ((uram_waddr_6==uram_waddr_reg[6]) && uram_wren_6 && uram_wren_6_reg)?uram_wdata_reg[6]:uram_rdata_6;
+        uram_rmwdata[7] = ((uram_waddr_7==uram_waddr_reg[7]) && uram_wren_7 && uram_wren_7_reg)?uram_wdata_reg[7]:uram_rdata_7;
+        uram_rmwdata[8] = ((uram_waddr_8==uram_waddr_reg[8]) && uram_wren_8 && uram_wren_8_reg)?uram_wdata_reg[8]:uram_rdata_8;
+        uram_rmwdata[9] = ((uram_waddr_9==uram_waddr_reg[9]) && uram_wren_9 && uram_wren_9_reg)?uram_wdata_reg[9]:uram_rdata_9;
+        uram_rmwdata[10] = ((uram_waddr_10==uram_waddr_reg[10]) && uram_wren_10 && uram_wren_10_reg)?uram_wdata_reg[10]:uram_rdata_10;
+        uram_rmwdata[11] = ((uram_waddr_11==uram_waddr_reg[11]) && uram_wren_11 && uram_wren_11_reg)?uram_wdata_reg[11]:uram_rdata_11;
+        uram_rmwdata[12] = ((uram_waddr_12==uram_waddr_reg[12]) && uram_wren_12 && uram_wren_12_reg)?uram_wdata_reg[12]:uram_rdata_12;
+        uram_rmwdata[13] = ((uram_waddr_13==uram_waddr_reg[13]) && uram_wren_13 && uram_wren_13_reg)?uram_wdata_reg[13]:uram_rdata_13;
+        uram_rmwdata[14] = ((uram_waddr_14==uram_waddr_reg[14]) && uram_wren_14 && uram_wren_14_reg)?uram_wdata_reg[14]:uram_rdata_14;
+        uram_rmwdata[15] = ((uram_waddr_15==uram_waddr_reg[15]) && uram_wren_15 && uram_wren_15_reg)?uram_wdata_reg[15]:uram_rdata_15;
+    end
+end
+
+/////////////////
+// ASSIGNMENTS //
+/////////////////
+
+assign URAM_ADDR_LIMIT = num_outputs[16:4];
+assign MICROPHASE_LIMIT = URAM_ADDR_LIMIT[12:9];
+assign MICROPHASE_MOD = URAM_ADDR_LIMIT[8:0];
+
+assign uram_microphase_addr_limit = (microphase_ctr==MICROPHASE_LIMIT)?MICROPHASE_MOD:9'd511;
+
+assign SET_GROUP = ci2iep_dout[52:49];
+assign SET_ROW   = ci2iep_dout[48:36];
+
+//////////////
+// BEHAVIOR //
+//////////////
+
+always @(posedge clk) begin
+    if (~resetn | uram_addr_rst)
+        uram_raddr <= 13'd0;
+    else if (uram_addr_inc)
+        uram_raddr <= uram_raddr + 1'b1;
+end
+
+always @(*) begin
+    if (~exec_uram_phase0_done || ~exec_uram_phase1_done) begin
+        //=================================================================
+        // EXP_PSC CHANGE 4a: Phase 0 Row B read address override
+        // At psc_substate==1, override to Row B (addr + ROW_B_FULL_OFFSET).
+        //=================================================================
+        if (!delta_mode && !exec_uram_phase0_done && psc_substate == 3'd1) begin
+            uram_raddr_0_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_1_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_2_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_3_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_4_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_5_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_6_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_7_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_8_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_9_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_10_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_11_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_12_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_13_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_14_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+            uram_raddr_15_full <= uram_raddr[12:0] + ROW_B_FULL_OFFSET;
+        end else begin
+            uram_raddr_0_full <= uram_raddr[12:0];
+            uram_raddr_1_full <= uram_raddr[12:0];
+            uram_raddr_2_full <= uram_raddr[12:0];
+            uram_raddr_3_full <= uram_raddr[12:0];
+            uram_raddr_4_full <= uram_raddr[12:0];
+            uram_raddr_5_full <= uram_raddr[12:0];
+            uram_raddr_6_full <= uram_raddr[12:0];
+            uram_raddr_7_full <= uram_raddr[12:0];
+            uram_raddr_8_full <= uram_raddr[12:0];
+            uram_raddr_9_full <= uram_raddr[12:0];
+            uram_raddr_10_full <= uram_raddr[12:0];
+            uram_raddr_11_full <= uram_raddr[12:0];
+            uram_raddr_12_full <= uram_raddr[12:0];
+            uram_raddr_13_full <= uram_raddr[12:0];
+            uram_raddr_14_full <= uram_raddr[12:0];
+            uram_raddr_15_full <= uram_raddr[12:0];
+        end
+    end else if (~exec_uram_phase2_done) begin
+        //=================================================================
+        // 64-BIT SYNAPSE + EXP_PSC CHANGE 4b: Phase 2 address extraction
+        //
+        // 8 entries per 512-bit FIFO word at 64-bit boundaries.
+        // dest_addr is at bits [60:48] within each 64-bit entry.
+        //
+        // Entry positions:
+        //   Entry 7: [511:448], dest_addr = [508:496]
+        //   Entry 6: [447:384], dest_addr = [444:432]
+        //   Entry 5: [383:320], dest_addr = [380:368]
+        //   Entry 4: [319:256], dest_addr = [316:304]
+        //   Entry 3: [255:192], dest_addr = [252:240]
+        //   Entry 2: [191:128], dest_addr = [188:176]
+        //   Entry 1: [127:64],  dest_addr = [124:112]
+        //   Entry 0: [63:0],    dest_addr = [60:48]
+        //
+        // Halfsel routing (matches weight extraction toggle):
+        //   halfsel=0: groups 0-7 get entries 7-0, groups 8-15 get addr=0
+        //   halfsel=1: groups 8-15 get entries 7-0, groups 0-7 get addr=0
+        //
+        // In delta_mode=0: add ROW_B_FULL_OFFSET for I_ex/I_in accumulation
+        //=================================================================
+        if (drain_inject) begin   // FIX I: single-bank injection
+            uram_raddr_0_full <= (drain_group == 4'd0) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_1_full <= (drain_group == 4'd1) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_2_full <= (drain_group == 4'd2) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_3_full <= (drain_group == 4'd3) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_4_full <= (drain_group == 4'd4) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_5_full <= (drain_group == 4'd5) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_6_full <= (drain_group == 4'd6) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_7_full <= (drain_group == 4'd7) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_8_full <= (drain_group == 4'd8) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_9_full <= (drain_group == 4'd9) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_10_full <= (drain_group == 4'd10) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_11_full <= (drain_group == 4'd11) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_12_full <= (drain_group == 4'd12) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_13_full <= (drain_group == 4'd13) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_14_full <= (drain_group == 4'd14) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+            uram_raddr_15_full <= (drain_group == 4'd15) ? (drain_dest + phase2_row_offset)
+                                                     : phase2_row_offset;
+        end else if (!syn_64bit_en) begin
+            uram_raddr_0_full  <= exec_hbm_rdata[508:496] + phase2_row_offset;
+            uram_raddr_1_full  <= exec_hbm_rdata[476:464] + phase2_row_offset;
+            uram_raddr_2_full  <= exec_hbm_rdata[444:432] + phase2_row_offset;
+            uram_raddr_3_full  <= exec_hbm_rdata[412:400] + phase2_row_offset;
+            uram_raddr_4_full  <= exec_hbm_rdata[380:368] + phase2_row_offset;
+            uram_raddr_5_full  <= exec_hbm_rdata[348:336] + phase2_row_offset;
+            uram_raddr_6_full  <= exec_hbm_rdata[316:304] + phase2_row_offset;
+            uram_raddr_7_full  <= exec_hbm_rdata[284:272] + phase2_row_offset;
+            uram_raddr_8_full  <= exec_hbm_rdata[252:240] + phase2_row_offset;
+            uram_raddr_9_full  <= exec_hbm_rdata[220:208] + phase2_row_offset;
+            uram_raddr_10_full <= exec_hbm_rdata[188:176] + phase2_row_offset;
+            uram_raddr_11_full <= exec_hbm_rdata[156:144] + phase2_row_offset;
+            uram_raddr_12_full <= exec_hbm_rdata[124:112] + phase2_row_offset;
+            uram_raddr_13_full <= exec_hbm_rdata[92:80] + phase2_row_offset;
+            uram_raddr_14_full <= exec_hbm_rdata[60:48] + phase2_row_offset;
+            uram_raddr_15_full <= exec_hbm_rdata[28:16] + phase2_row_offset;
+        end else if (~phase2_halfsel) begin
+            uram_raddr_0_full <= exec_hbm_rdata[508:496] + phase2_row_offset;
+            uram_raddr_1_full <= exec_hbm_rdata[444:432] + phase2_row_offset;
+            uram_raddr_2_full <= exec_hbm_rdata[380:368] + phase2_row_offset;
+            uram_raddr_3_full <= exec_hbm_rdata[316:304] + phase2_row_offset;
+            uram_raddr_4_full <= exec_hbm_rdata[252:240] + phase2_row_offset;
+            uram_raddr_5_full <= exec_hbm_rdata[188:176] + phase2_row_offset;
+            uram_raddr_6_full <= exec_hbm_rdata[124:112] + phase2_row_offset;
+            uram_raddr_7_full <= exec_hbm_rdata[60:48] + phase2_row_offset;
+            uram_raddr_8_full <= phase2_row_offset;
+            uram_raddr_9_full <= phase2_row_offset;
+            uram_raddr_10_full <= phase2_row_offset;
+            uram_raddr_11_full <= phase2_row_offset;
+            uram_raddr_12_full <= phase2_row_offset;
+            uram_raddr_13_full <= phase2_row_offset;
+            uram_raddr_14_full <= phase2_row_offset;
+            uram_raddr_15_full <= phase2_row_offset;
+        end else begin
+            uram_raddr_0_full <= phase2_row_offset;
+            uram_raddr_1_full <= phase2_row_offset;
+            uram_raddr_2_full <= phase2_row_offset;
+            uram_raddr_3_full <= phase2_row_offset;
+            uram_raddr_4_full <= phase2_row_offset;
+            uram_raddr_5_full <= phase2_row_offset;
+            uram_raddr_6_full <= phase2_row_offset;
+            uram_raddr_7_full <= phase2_row_offset;
+            uram_raddr_8_full <= exec_hbm_rdata[508:496] + phase2_row_offset;
+            uram_raddr_9_full <= exec_hbm_rdata[444:432] + phase2_row_offset;
+            uram_raddr_10_full <= exec_hbm_rdata[380:368] + phase2_row_offset;
+            uram_raddr_11_full <= exec_hbm_rdata[316:304] + phase2_row_offset;
+            uram_raddr_12_full <= exec_hbm_rdata[252:240] + phase2_row_offset;
+            uram_raddr_13_full <= exec_hbm_rdata[188:176] + phase2_row_offset;
+            uram_raddr_14_full <= exec_hbm_rdata[124:112] + phase2_row_offset;
+            uram_raddr_15_full <= exec_hbm_rdata[60:48] + phase2_row_offset;
+        end
+
+    end else begin
+        uram_raddr_0_full <= SET_ROW;
+        uram_raddr_1_full <= SET_ROW;
+        uram_raddr_2_full <= SET_ROW;
+        uram_raddr_3_full <= SET_ROW;
+        uram_raddr_4_full <= SET_ROW;
+        uram_raddr_5_full <= SET_ROW;
+        uram_raddr_6_full <= SET_ROW;
+        uram_raddr_7_full <= SET_ROW;
+        uram_raddr_8_full <= SET_ROW;
+        uram_raddr_9_full <= SET_ROW;
+        uram_raddr_10_full <= SET_ROW;
+        uram_raddr_11_full <= SET_ROW;
+        uram_raddr_12_full <= SET_ROW;
+        uram_raddr_13_full <= SET_ROW;
+        uram_raddr_14_full <= SET_ROW;
+        uram_raddr_15_full <= SET_ROW;
+    end
+end
+
+always @(posedge clk) begin
+     if (~resetn) begin
+            uram_raddr_0_full_reg <= 13'd0;
+            uram_raddr_1_full_reg <= 13'd0;
+            uram_raddr_2_full_reg <= 13'd0;
+            uram_raddr_3_full_reg <= 13'd0;
+            uram_raddr_4_full_reg <= 13'd0;
+            uram_raddr_5_full_reg <= 13'd0;
+            uram_raddr_6_full_reg <= 13'd0;
+            uram_raddr_7_full_reg <= 13'd0;
+            uram_raddr_8_full_reg <= 13'd0;
+            uram_raddr_9_full_reg <= 13'd0;
+            uram_raddr_10_full_reg <= 13'd0;
+            uram_raddr_11_full_reg <= 13'd0;
+            uram_raddr_12_full_reg <= 13'd0;
+            uram_raddr_13_full_reg <= 13'd0;
+            uram_raddr_14_full_reg <= 13'd0;
+            uram_raddr_15_full_reg <= 13'd0;   
+            exec_hbm_rdata_reg <= 512'b0;   
+     end else begin
+            uram_raddr_0_full_reg <= uram_raddr_0_full;
+            uram_raddr_1_full_reg <= uram_raddr_1_full;
+            uram_raddr_2_full_reg <= uram_raddr_2_full;
+            uram_raddr_3_full_reg <= uram_raddr_3_full;
+            uram_raddr_4_full_reg <= uram_raddr_4_full;
+            uram_raddr_5_full_reg <= uram_raddr_5_full;
+            uram_raddr_6_full_reg <= uram_raddr_6_full;
+            uram_raddr_7_full_reg <= uram_raddr_7_full;     
+            uram_raddr_8_full_reg <= uram_raddr_8_full;
+            uram_raddr_9_full_reg <= uram_raddr_9_full;
+            uram_raddr_10_full_reg <= uram_raddr_10_full;
+            uram_raddr_11_full_reg <= uram_raddr_11_full;
+            uram_raddr_12_full_reg <= uram_raddr_12_full;
+            uram_raddr_13_full_reg <= uram_raddr_13_full;
+            uram_raddr_14_full_reg <= uram_raddr_14_full;
+            uram_raddr_15_full_reg <= uram_raddr_15_full;  
+            exec_hbm_rdata_reg <= exec_hbm_rdata;  
+     end
+end
+
+always @(*) begin
+    uram_rden_0 = uram_rden;
+    uram_rden_1 = uram_rden;
+    uram_rden_2 = uram_rden;
+    uram_rden_3 = uram_rden;
+    uram_rden_4 = uram_rden;
+    uram_rden_5 = uram_rden;
+    uram_rden_6 = uram_rden;
+    uram_rden_7 = uram_rden; 
+    uram_rden_8 = uram_rden;
+    uram_rden_9 = uram_rden;
+    uram_rden_10 = uram_rden;
+    uram_rden_11 = uram_rden;
+    uram_rden_12 = uram_rden;
+    uram_rden_13 = uram_rden;
+    uram_rden_14 = uram_rden;
+    uram_rden_15 = uram_rden; 
+    
+    uram_raddr_0 = uram_raddr_0_full[12:1];
+    uram_raddr_1 = uram_raddr_1_full[12:1];
+    uram_raddr_2 = uram_raddr_2_full[12:1];
+    uram_raddr_3 = uram_raddr_3_full[12:1];
+    uram_raddr_4 = uram_raddr_4_full[12:1];
+    uram_raddr_5 = uram_raddr_5_full[12:1];
+    uram_raddr_6 = uram_raddr_6_full[12:1];
+    uram_raddr_7 = uram_raddr_7_full[12:1];
+    uram_raddr_8 = uram_raddr_8_full[12:1];
+    uram_raddr_9 = uram_raddr_9_full[12:1];
+    uram_raddr_10 = uram_raddr_10_full[12:1];
+    uram_raddr_11 = uram_raddr_11_full[12:1];
+    uram_raddr_12 = uram_raddr_12_full[12:1];
+    uram_raddr_13 = uram_raddr_13_full[12:1];
+    uram_raddr_14 = uram_raddr_14_full[12:1];
+    uram_raddr_15 = uram_raddr_15_full[12:1];
+end
+
+always @(posedge clk) begin
+    if (~resetn | uram_addr_rst) begin
+        uram_waddr[0] <= 13'd0;
+        uram_waddr[1] <= 13'd0;
+        uram_waddr[2] <= 13'd0;
+        uram_waddr[3] <= 13'd0;
+        uram_waddr[4] <= 13'd0;
+        uram_waddr[5] <= 13'd0;
+        uram_waddr[6] <= 13'd0;
+        uram_waddr[7] <= 13'd0;
+        uram_waddr[8] <= 13'd0;
+        uram_waddr[9] <= 13'd0;
+        uram_waddr[10] <= 13'd0;
+        uram_waddr[11] <= 13'd0;
+        uram_waddr[12] <= 13'd0;
+        uram_waddr[13] <= 13'd0;
+        uram_waddr[14] <= 13'd0;
+        uram_waddr[15] <= 13'd0;
+    end else if (uram_rden) begin
+        uram_waddr[0] <= uram_raddr_0_full;
+        uram_waddr[1] <= uram_raddr_1_full;
+        uram_waddr[2] <= uram_raddr_2_full;
+        uram_waddr[3] <= uram_raddr_3_full;
+        uram_waddr[4] <= uram_raddr_4_full;
+        uram_waddr[5] <= uram_raddr_5_full;
+        uram_waddr[6] <= uram_raddr_6_full;
+        uram_waddr[7] <= uram_raddr_7_full;
+        uram_waddr[8] <= uram_raddr_8_full;
+        uram_waddr[9] <= uram_raddr_9_full;
+        uram_waddr[10] <= uram_raddr_10_full;
+        uram_waddr[11] <= uram_raddr_11_full;
+        uram_waddr[12] <= uram_raddr_12_full;
+        uram_waddr[13] <= uram_raddr_13_full;
+        uram_waddr[14] <= uram_raddr_14_full;
+        uram_waddr[15] <= uram_raddr_15_full;
+    end
+end
+
+//=========================================================================
+// FIX 4: uram_waddr override for exp_psc Phase 0 sub-states
+// Sub 2: Write Row A → use psc_saved_full_addr[12:1]
+// Sub 3: Write Row B → use psc_saved_full_addr[12:1] + ROW_B_ROW_OFFSET
+// All other states: unchanged
+//=========================================================================
+wire psc_waddr_override = !delta_mode && !exec_uram_phase0_done && 
+                          (psc_substate == 3'd3 || psc_substate == 3'd4);
+
+//=========================================================================
+// FIX A: uram_wren is a REGISTERED signal (driven in an always @(posedge clk)
+// block further down), so a value computed in cycle X only takes effect in
+// cycle X+1.  psc_suppress_wren / psc_manual_wren were THEMSELVES registered,
+// giving a two-substate skew:
+//   sub 1  : wren=1 (should be 0) -> legacy delta branch writes V = 0
+//   sub 3  : wren=0 (should be 1) -> Row A write NEVER HAPPENS, so the
+//                                    accumulated I_ex never reaches V
+//   post-4 : wren=1 (should be 0) -> uram_waddr[0] still holds the Row B
+//                                    address, corrupting Row B
+// Decode the window combinationally from the CURRENT substate instead:
+// asserting at sub 2/3 produces the writes at sub 3 (Row A) and sub 4 (Row B).
+// curr_state is in the gate so the legitimate Phase-1 spike-bit-clear write in
+// STATE_FILL_PIPE_PHASE1 (where exec_uram_phase0_done is still 0) is not lost.
+//=========================================================================
+wire psc_phase0_active = !delta_mode && !exec_uram_phase0_done &&
+                         (curr_state == STATE_PHASE0_READ_SPIKES);
+wire psc_wren_next     = (psc_substate == 3'd2) || (psc_substate == 3'd3);
+wire [11:0] psc_waddr_row_a = psc_saved_full_addr[12:1];
+wire [11:0] psc_waddr_row_b = psc_saved_full_addr[12:1] + ROW_B_ROW_OFFSET;
+wire [11:0] psc_waddr_sel   = (psc_substate == 3'd3) ? psc_waddr_row_a : psc_waddr_row_b;
+
+assign uram_waddr_0  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[0][12:1];
+assign uram_waddr_1  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[1][12:1];
+assign uram_waddr_2  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[2][12:1];
+assign uram_waddr_3  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[3][12:1];
+assign uram_waddr_4  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[4][12:1];
+assign uram_waddr_5  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[5][12:1];
+assign uram_waddr_6  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[6][12:1];
+assign uram_waddr_7  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[7][12:1];
+assign uram_waddr_8  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[8][12:1];
+assign uram_waddr_9  = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[9][12:1];
+assign uram_waddr_10 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[10][12:1];
+assign uram_waddr_11 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[11][12:1];
+assign uram_waddr_12 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[12][12:1];
+assign uram_waddr_13 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[13][12:1];
+assign uram_waddr_14 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[14][12:1];
+assign uram_waddr_15 = (curr_state==STATE_INIT_URAM) ? uram_init_addr : (curr_state==STATE_WRITE_URAM) ? SET_ROW_reg[12:1] : psc_waddr_override ? psc_waddr_sel : uram_waddr[15][12:1];
+
+//=========================================================================
+// 64-BIT SYNAPSE: Phase 2 weight extraction with half-select toggle
+//
+// 8 entries per 512-bit FIFO word. Toggle phase2_halfsel each read:
+//   halfsel=0: entries map to groups 0-7, groups 8-15 get zero weight
+//   halfsel=1: entries map to groups 8-15, groups 0-7 get zero weight
+//
+// Entry mapping (reversed, matching original MSB-first order):
+//   Entry 7 at [511:448] → group offset 0 (lowest in active half)
+//   Entry 6 at [447:384] → group offset 1
+//   ...
+//   Entry 0 at [63:0]    → group offset 7 (highest in active half)
+//
+// Weight field: entry[47:32] (16-bit signed)
+// Opcode[2] check: entry[63] - if set, zero the weight (future opcode guard)
+//=========================================================================
+always @(posedge clk) begin
+    if (~resetn) begin
+        phase2_halfsel <= 1'b0;
+        for (i = 0; i < 8; i = i + 1)
+            exec_hbm_rdata_reg_arr_64[i] <= 64'd0;
+        for (i = 0; i < NEURON_GROUPS; i = i + 1)
+            exec_hbm_rdata_reg_arr[i] <= 16'sd0;
+    end else if (drain_inject) begin   // FIX I: only drain_group carries a weight
+        for (i = 0; i < NEURON_GROUPS; i = i + 1)
+            exec_hbm_rdata_reg_arr[i] <= (drain_group == i[3:0]) ? drain_weight : 16'sd0;
+    end else if (curr_state == STATE_PHASE1_DONE) begin
+        // Reset toggle at start of each Phase 2
+        phase2_halfsel <= 1'b0;
+    end else if (exec_hbm_rvr_p2) begin   // FIX G
+        // Latch 8 x 64-bit raw entries for field extraction
+        exec_hbm_rdata_reg_arr_64[0] <= exec_hbm_rdata[63:0];
+        exec_hbm_rdata_reg_arr_64[1] <= exec_hbm_rdata[127:64];
+        exec_hbm_rdata_reg_arr_64[2] <= exec_hbm_rdata[191:128];
+        exec_hbm_rdata_reg_arr_64[3] <= exec_hbm_rdata[255:192];
+        exec_hbm_rdata_reg_arr_64[4] <= exec_hbm_rdata[319:256];
+        exec_hbm_rdata_reg_arr_64[5] <= exec_hbm_rdata[383:320];
+        exec_hbm_rdata_reg_arr_64[6] <= exec_hbm_rdata[447:384];
+        exec_hbm_rdata_reg_arr_64[7] <= exec_hbm_rdata[511:448];
+
+        if (!syn_64bit_en) begin
+            exec_hbm_rdata_reg_arr[0]  <= exec_hbm_rdata[511] ? 16'sd0 : exec_hbm_rdata[495:480];
+            exec_hbm_rdata_reg_arr[1]  <= exec_hbm_rdata[479] ? 16'sd0 : exec_hbm_rdata[463:448];
+            exec_hbm_rdata_reg_arr[2]  <= exec_hbm_rdata[447] ? 16'sd0 : exec_hbm_rdata[431:416];
+            exec_hbm_rdata_reg_arr[3]  <= exec_hbm_rdata[415] ? 16'sd0 : exec_hbm_rdata[399:384];
+            exec_hbm_rdata_reg_arr[4]  <= exec_hbm_rdata[383] ? 16'sd0 : exec_hbm_rdata[367:352];
+            exec_hbm_rdata_reg_arr[5]  <= exec_hbm_rdata[351] ? 16'sd0 : exec_hbm_rdata[335:320];
+            exec_hbm_rdata_reg_arr[6]  <= exec_hbm_rdata[319] ? 16'sd0 : exec_hbm_rdata[303:288];
+            exec_hbm_rdata_reg_arr[7]  <= exec_hbm_rdata[287] ? 16'sd0 : exec_hbm_rdata[271:256];
+            exec_hbm_rdata_reg_arr[8]  <= exec_hbm_rdata[255] ? 16'sd0 : exec_hbm_rdata[239:224];
+            exec_hbm_rdata_reg_arr[9]  <= exec_hbm_rdata[223] ? 16'sd0 : exec_hbm_rdata[207:192];
+            exec_hbm_rdata_reg_arr[10] <= exec_hbm_rdata[191] ? 16'sd0 : exec_hbm_rdata[175:160];
+            exec_hbm_rdata_reg_arr[11] <= exec_hbm_rdata[159] ? 16'sd0 : exec_hbm_rdata[143:128];
+            exec_hbm_rdata_reg_arr[12] <= exec_hbm_rdata[127] ? 16'sd0 : exec_hbm_rdata[111:96];
+            exec_hbm_rdata_reg_arr[13] <= exec_hbm_rdata[95] ? 16'sd0 : exec_hbm_rdata[79:64];
+            exec_hbm_rdata_reg_arr[14] <= exec_hbm_rdata[63] ? 16'sd0 : exec_hbm_rdata[47:32];
+            exec_hbm_rdata_reg_arr[15] <= exec_hbm_rdata[31] ? 16'sd0 : exec_hbm_rdata[15:0];
+        end else if (~phase2_halfsel) begin
+            exec_hbm_rdata_reg_arr[0 ] <= (exec_hbm_rdata[511] || exec_hbm_rdata[479:474] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[495:480];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[1 ] <= (exec_hbm_rdata[447] || exec_hbm_rdata[415:410] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[431:416];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[2 ] <= (exec_hbm_rdata[383] || exec_hbm_rdata[351:346] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[367:352];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[3 ] <= (exec_hbm_rdata[319] || exec_hbm_rdata[287:282] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[303:288];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[4 ] <= (exec_hbm_rdata[255] || exec_hbm_rdata[223:218] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[239:224];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[5 ] <= (exec_hbm_rdata[191] || exec_hbm_rdata[159:154] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[175:160];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[6 ] <= (exec_hbm_rdata[127] || exec_hbm_rdata[95:90] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[111:96];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[7 ] <= (exec_hbm_rdata[63] || exec_hbm_rdata[31:26] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[47:32];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[8 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[9 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[10] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[11] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[12] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[13] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[14] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[15] <= 16'sd0;
+        end else begin
+            exec_hbm_rdata_reg_arr[0 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[1 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[2 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[3 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[4 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[5 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[6 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[7 ] <= 16'sd0;
+            exec_hbm_rdata_reg_arr[8 ] <= (exec_hbm_rdata[511] || exec_hbm_rdata[479:474] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[495:480];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[9 ] <= (exec_hbm_rdata[447] || exec_hbm_rdata[415:410] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[431:416];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[10] <= (exec_hbm_rdata[383] || exec_hbm_rdata[351:346] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[367:352];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[11] <= (exec_hbm_rdata[319] || exec_hbm_rdata[287:282] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[303:288];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[12] <= (exec_hbm_rdata[255] || exec_hbm_rdata[223:218] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[239:224];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[13] <= (exec_hbm_rdata[191] || exec_hbm_rdata[159:154] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[175:160];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[14] <= (exec_hbm_rdata[127] || exec_hbm_rdata[95:90] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[111:96];  // FIX H: delay>0 -> buffer only
+            exec_hbm_rdata_reg_arr[15] <= (exec_hbm_rdata[63] || exec_hbm_rdata[31:26] != 6'd0)
+                                       ? 16'sd0 : exec_hbm_rdata[47:32];  // FIX H: delay>0 -> buffer only
+        end
+
+        // halfsel advances only in 64-bit mode.  Each axon's synapse region is
+        // 4 HBM rows = 2 words, so Phase-2 words always arrive in pairs and the
+        // toggle stays in phase across multiple axon pointers.
+        // Capture the halfsel that applies to the arr_64 just latched: the
+        // scan block below runs AFTER this toggle, so it must not use the
+        // live value.
+        phase2_halfsel_at_latch <= phase2_halfsel;
+        if (!delta_mode && syn_64bit_en) phase2_halfsel <= ~phase2_halfsel;
+
+    end
+end
+
+//=========================================================================
+// DELAY BUFFER: Route entries with delay>0 to delay_buffer during Phase 2
+//
+// For each 64-bit entry extracted during Phase 2:
+//   - If delay=0: weight passes through normally (accumulated above)
+//   - If delay>0 AND opcode=000 (LOCAL): push to delay_buffer, zero weight
+//     in exec_hbm_rdata_reg_arr so Phase 2 accumulates nothing
+//
+// The delay_buffer will drain expired entries before Phase 0 of the
+// next timestep, at which point they're accumulated into URAM.
+//
+// We process entries sequentially via a 3-bit counter (0-7) since
+// we have 8 entries per FIFO word.
+//=========================================================================
+reg       phase2_halfsel_at_latch;
+
+//=========================================================================
+// FIX G: the delay-buffer push scan walks 8 entries at one per cycle, but
+// nothing throttled the Phase-2 FIFO.  exec_hbm_rvalidready can assert
+// back-to-back, which reset dbuf_entry_idx mid-scan and silently dropped
+// every entry the scan had not reached.  Measured: words 3 cycles apart lost
+// 8 of 16 delayed synapses.  Stall word acceptance while a scan is in
+// flight.  64-bit mode only -- the 32-bit path never scans.
+//=========================================================================
+wire phase2_scan_stall = syn_64bit_en && dbuf_phase2_active &&
+                         (curr_state == STATE_POP_PTR_FIFO);
+wire exec_hbm_rvr_p2   = exec_hbm_rvalidready && !phase2_scan_stall;
+
+//=========================================================================
+// FIX I: drain the delay buffer and accumulate its entries into URAM.
+// timestep_tick is exec_run, so the buffer starts draining at the top of the
+// timestep and HOLDS each entry until delayed_ready.  We consume them in
+// STATE_PHASE1_DONE, which already asserts exec_uram_phase1_done, so the
+// address block is already in Row B mode and no new FSM state code is needed
+// (all 16 are taken).  A drained entry is INJECTED into the existing Phase-2
+// accumulate rather than given a new masked write path.
+//   sub 0 capture  1 raise inject  2 addr/arr settle
+//   sub 3 pulse uram_rden  4 waddr latches  5 accumulate lands, ack
+//=========================================================================
+reg [2:0]  drain_sub;
+reg [12:0] drain_dest;
+reg signed [15:0] drain_weight;
+reg [3:0]  drain_group;
+reg        drain_inject;
+// Bounded so a delay_buffer that never raises drain_done cannot hang Phase 1.
+reg [9:0]  drain_timeout;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        drain_sub <= 3'd0; drain_inject <= 1'b0; drain_dest <= 13'd0;
+        drain_weight <= 16'sd0; drain_group <= 4'd0; dbuf_delayed_ready <= 1'b0; drain_timeout <= 10'd0;
+    end else begin
+        dbuf_delayed_ready <= 1'b0;
+        if (curr_state != STATE_PHASE1_DONE) drain_timeout <= 10'd0;
+        else if (drain_timeout != 10'h3FF)   drain_timeout <= drain_timeout + 1'b1;
+        if (syn_64bit_en && curr_state == STATE_PHASE1_DONE) begin
+            case (drain_sub)
+                // dbuf_delayed_ready is registered, so during sub 0 the buffer
+                // has not yet dropped delayed_valid for the entry we just
+                // acked.  Without this guard the same entry is captured twice
+                // and the final entry of the drain is lost.
+                3'd0: if (dbuf_delayed_valid && !dbuf_delayed_ready) begin
+                          drain_dest   <= dbuf_delayed_dest;
+                          drain_weight <= dbuf_delayed_weight;
+                          drain_group  <= dbuf_delayed_group;
+                          drain_sub    <= 3'd1;
+                      end
+                3'd1: begin drain_inject <= 1'b1; drain_sub <= 3'd2; end
+                3'd2: drain_sub <= 3'd3;
+                3'd3: drain_sub <= 3'd4;
+                3'd4: drain_sub <= 3'd5;
+                3'd5: begin drain_inject <= 1'b0; dbuf_delayed_ready <= 1'b1;
+                            drain_sub <= 3'd0; end
+                default: drain_sub <= 3'd0;
+            endcase
+        end else begin
+            drain_sub <= 3'd0; drain_inject <= 1'b0;
+        end
+    end
+end
+reg [2:0] dbuf_entry_idx;
+reg       dbuf_phase2_active;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        dbuf_syn_valid <= 1'b0;
+        dbuf_entry_idx <= 3'd0;
+        dbuf_phase2_active <= 1'b0;
+        phase2_halfsel_at_latch <= 1'b0;
+        dbuf_syn_group <= 4'd0;
+        dbuf_delayed_ready <= 1'b0;
+    end else begin
+        dbuf_syn_valid <= 1'b0;
+
+        if (exec_hbm_rvr_p2 && ~exec_uram_phase2_done) begin   // FIX G
+            // Phase 2 FIFO read happened - scan all 8 entries for delay>0
+            dbuf_entry_idx <= 3'd0;
+            dbuf_phase2_active <= 1'b1;
+        end
+
+        if (dbuf_phase2_active && dbuf_entry_idx <= 3'd7) begin
+            // Check each entry: is it LOCAL with delay>0?
+            if (syn_64bit_en &&
+                exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][63:61] == 3'b000 &&
+                exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][31:26] != 6'd0) begin
+                // Push to delay buffer
+                dbuf_syn_valid    <= 1'b1;
+                dbuf_syn_dest     <= exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][60:48];
+                dbuf_syn_weight   <= exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][47:32];
+                dbuf_syn_delay    <= exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][31:26];
+                dbuf_syn_src      <= exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][17:0];
+                dbuf_syn_stdp_tag <= exec_hbm_rdata_reg_arr_64[dbuf_entry_idx][21:18];
+                // arr_64[7] holds exec_hbm_rdata[511:448], which feeds group 0,
+                // so group = 7 - idx in the low half and 15 - idx in the high
+                // half.  Uses the LATCHED halfsel, not the live one.
+                dbuf_syn_group    <= phase2_halfsel_at_latch ? (4'd15 - {1'b0, dbuf_entry_idx})
+                                                             : (4'd7  - {1'b0, dbuf_entry_idx});
+                // Zero the weight in the accumulation array so Phase 2 skips it
+                // (The group mapping depends on halfsel, handled by checking
+                //  which group this entry maps to - but since the weight is
+                //  already latched, we zero it post-facto)
+            end
+            dbuf_entry_idx <= dbuf_entry_idx + 3'd1;
+            if (dbuf_entry_idx == 3'd7)
+                dbuf_phase2_active <= 1'b0;
+        end
+
+        // FIX I: dbuf_delayed_ready now driven by the drain sequencer.
+    end
+end
+
+always @(posedge clk) begin
+    exec_hbm_rvalidready_reg <= exec_hbm_rvalidready;
+    exec_hbm_rvalidready_reg2 <= exec_hbm_rvalidready_reg;
+    uram_wdata_reg[0] <= uram_wdata_0;
+    uram_wdata_reg[1] <= uram_wdata_1;
+    uram_wdata_reg[2] <= uram_wdata_2;
+    uram_wdata_reg[3] <= uram_wdata_3;
+    uram_wdata_reg[4] <= uram_wdata_4;
+    uram_wdata_reg[5] <= uram_wdata_5;
+    uram_wdata_reg[6] <= uram_wdata_6;
+    uram_wdata_reg[7] <= uram_wdata_7;
+    uram_wdata_reg[8] <= uram_wdata_8;
+    uram_wdata_reg[9] <= uram_wdata_9;
+    uram_wdata_reg[10] <= uram_wdata_10;
+    uram_wdata_reg[11] <= uram_wdata_11;
+    uram_wdata_reg[12] <= uram_wdata_12;
+    uram_wdata_reg[13] <= uram_wdata_13;
+    uram_wdata_reg[14] <= uram_wdata_14;
+    uram_wdata_reg[15] <= uram_wdata_15;
+    uram_waddr_reg[0] <= uram_waddr_0;
+    uram_waddr_reg[1] <= uram_waddr_1;
+    uram_waddr_reg[2] <= uram_waddr_2;
+    uram_waddr_reg[3] <= uram_waddr_3;
+    uram_waddr_reg[4] <= uram_waddr_4;
+    uram_waddr_reg[5] <= uram_waddr_5;
+    uram_waddr_reg[6] <= uram_waddr_6;
+    uram_waddr_reg[7] <= uram_waddr_7;
+    uram_waddr_reg[8] <= uram_waddr_8;
+    uram_waddr_reg[9] <= uram_waddr_9;
+    uram_waddr_reg[10] <= uram_waddr_10;
+    uram_waddr_reg[11] <= uram_waddr_11;
+    uram_waddr_reg[12] <= uram_waddr_12;
+    uram_waddr_reg[13] <= uram_waddr_13;
+    uram_waddr_reg[14] <= uram_waddr_14;
+    uram_waddr_reg[15] <= uram_waddr_15;
+    SET_GROUP_reg <= SET_GROUP;
+    SET_ROW_reg <= SET_ROW;
+    uram_wren_0_reg <= uram_wren_0;
+    uram_wren_1_reg <= uram_wren_1;
+    uram_wren_2_reg <= uram_wren_2;
+    uram_wren_3_reg <= uram_wren_3;
+    uram_wren_4_reg <= uram_wren_4;
+    uram_wren_5_reg <= uram_wren_5;
+    uram_wren_6_reg <= uram_wren_6;
+    uram_wren_7_reg <= uram_wren_7;
+    uram_wren_8_reg <= uram_wren_8;
+    uram_wren_9_reg <= uram_wren_9;
+    uram_wren_10_reg <= uram_wren_10;
+    uram_wren_11_reg <= uram_wren_11;
+    uram_wren_12_reg <= uram_wren_12;
+    uram_wren_13_reg <= uram_wren_13;
+    uram_wren_14_reg <= uram_wren_14;
+    uram_wren_15_reg <= uram_wren_15;
+end
+
+//=============================================================================
+// PRBS NOISE GENERATION - FIXED VERSION
+//=============================================================================
+// New behavior:
+//   shift_param = 0:   Unshifted noise (full 16-bit PRBS contribution)
+//   shift_param > 0:   Left shift (larger noise, up to +15)
+//   shift_param < 0:   Right shift (smaller noise)
+//   shift_param <= -17: No noise (shifted to zero)
+//
+// shift_param is treated as 6-bit signed: range -32 to +31
+//=============================================================================
+
+wire [255:0] prbs;
+reg [15:0] prbs_ng[NEURON_GROUPS-1:0];
+reg [16:0] prbs_regularized[NEURON_GROUPS-1:0];
+reg [34:0] prbs_shift[NEURON_GROUPS-1:0];
+reg signed [35:0] prbs_shift_signext[NEURON_GROUPS-1:0];
+
+// Compute absolute value of shift for shifting operations
+wire [5:0] shift_abs;
+wire shift_is_negative;
+wire noise_disabled;
+
+assign shift_is_negative = shift_param[5];  // MSB indicates negative (signed)
+assign shift_abs = shift_is_negative ? (~shift_param + 1'b1) : shift_param;  // Absolute value
+assign noise_disabled = shift_is_negative && (shift_abs >= 6'd17);  // shift <= -17 disables noise
+
+prbs_512b prbs_inst (
+    .clk(clk),
+    .resetn(resetn),     
+    .prbs (prbs)
+);
+
+always @(*) begin
+    for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+        prbs_ng[i] = prbs[i*NEURON_GROUPS+:16];
+        prbs_regularized[i] = 2*prbs_ng[i]+1;  // 17-bit value, MSB is sign
+        
+        // FIXED NOISE SHIFT LOGIC
+        if (noise_disabled) begin
+            // shift <= -17: No noise
+            prbs_shift[i] = 35'd0;
+        end else if (shift_is_negative) begin
+            // Negative shift (but > -17): Right shift (smaller noise)
+            // Use full 17-bit prbs_regularized so shift=-16 still yields nonzero
+            prbs_shift[i] = {18'd0, prbs_regularized[i]} >> shift_abs;
+        end else begin
+            // Zero or positive shift: Left shift (larger noise)
+            // shift=0: unshifted, shift=+15: large noise
+            prbs_shift[i] = prbs_regularized[i][15:0] << shift_abs;
+        end
+        
+        // Sign extension based on prbs_regularized MSB (sign bit)
+        if (prbs_regularized[i][16]) begin
+            // Negative PRBS value
+            if (prbs_shift[i] == 0) begin
+                prbs_shift_signext[i] = 36'sd0;  // Corner case: shifted to zero
+            end else begin
+                prbs_shift_signext[i][35] = 1'b1;  // Sign bit
+                prbs_shift_signext[i][34:0] = 36'h800000000 - prbs_shift[i];
+            end
+        end else begin
+            // Positive PRBS value
+            prbs_shift_signext[i] = {1'b0, prbs_shift[i]};
+        end
+    end
+end
+
+//=============================================================================
+// URAM WRITE DATA LOGIC (unchanged except uses fixed prbs_shift_signext)
+//=============================================================================
+
+always @(*) begin
+    //=========================================================================
+    // DEFAULT: zero psc_new_row_b_comb to avoid latch inference
+    //=========================================================================
+    for (i = 0; i < NEURON_GROUPS; i=i+1)
+        psc_new_row_b_comb[i] = 72'd0;
+    
+    //=========================================================================
+    // FIX 5: Sub-state 3 - output registered new_row_b for Row B write
+    // This takes priority over all other conditions during Phase 0.
+    //=========================================================================
+    if (!delta_mode && !exec_uram_phase0_done && psc_substate == 3'd4) begin
+        for (i = 0; i < NEURON_GROUPS; i=i+1)
+            uram_wdata[i] = new_row_b[i];
+            
+    end else if (curr_state==STATE_INIT_URAM) begin
+        for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+            uram_wdata[i] = 72'd0;
+        end
+    end else if (curr_state==STATE_WRITE_URAM) begin
+        for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+            uram_wdata[i] = (uram_waddr[i][0])? {ci2iep_dout[35:0], uram_rmwdata_lower[i]}:{uram_rmwdata_upper[i],ci2iep_dout[35:0]};
+        end
+    end else if (!exec_uram_phase0_done && !exec_uram_phase1_done) begin
+        for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+            //=================================================================
+            // FIX 1+2: EXP_PSC Phase 0 neuron computation
+            // At sub-state 2, uram_rmwdata holds ROW B (I_ex, I_in, w, trace).
+            // Row A (V, spike, refrac) is in row_a_latched.
+            // Compute new V from row_a_latched + decayed Row B, and
+            // compute new Row B (psc_new_row_b_comb) for sub-state 3 write.
+            //=================================================================
+            if (!delta_mode && psc_substate == 3'd3) begin
+                if (psc_saved_full_addr[0]) begin
+                    //--- ODD ADDRESS: active neuron is upper half-word ---
+                    // Extract Row A upper from latched data
+                    // row_a_latched[i][71:36] = {spike, refrac[2:0], V[31:0]}
+                    if (row_a_latched[i][70:68] > 3'd0) begin
+                        // Refractory: decrement counter, preserve V, suppress spike
+                        uram_wdata[i] = {1'b0, row_a_latched[i][70:68] - 3'd1, row_a_latched[i][67:36],
+                                         row_a_latched[i][35:0]};
+                        // Row B: decay only, no spike effects
+                        psc_new_row_b_comb[i] = {psc_i_ex_decayed[i], psc_i_in_decayed[i], psc_w_decayed[i],
+                                                  (psc_rowb_trace[i] > 4'd0) ? psc_rowb_trace[i] - 4'd1 : 4'd0,
+                                                  uram_rmwdata[i][35:0]};
+                    end else begin
+                        // Not refractory - full neuron model
+                        //-------------------------------------------------------------
+                        // V_new = V - (V >> leak) + drive_ex + drive_in - w + noise
+                        //
+                        // CUBA (coba_mode=0): drive_ex = sign_ext(I_ex_decayed)
+                        // COBA (coba_mode=1): drive_ex = g_ex × (E_ex - V) >>> 12
+                        // (selected by coba_drive_ex_upper[i])
+                        //
+                        // Threshold includes neuromodulation bias:
+                        //   effective_threshold = threshold - neuromod_excitability_bias
+                        //-------------------------------------------------------------
+                        if (($signed(row_a_latched[i][67:36]) - psc_leak_term_u[i]
+                             + coba_drive_ex_upper[i]
+                             + coba_drive_in_upper[i]
+                             - $signed({24'd0, psc_w_decayed[i]})
+                             + $signed(prbs_shift_signext[i][31:0])
+                             > $signed(effective_threshold))
+                            && ({psc_saved_full_addr, i[3:0]} < num_outputs)) begin
+                            // SPIKE
+                            if (soft_reset_en_param)
+                                uram_wdata[i] = {1'b1, refractory_max_param,
+                                    $signed(row_a_latched[i][67:36]) - psc_leak_term_u[i]
+                                    + coba_drive_ex_upper[i]
+                                    + coba_drive_in_upper[i]
+                                    - $signed({24'd0, psc_w_decayed[i]})
+                                    + $signed(prbs_shift_signext[i][31:0])
+                                    - effective_threshold,
+                                    row_a_latched[i][35:0]};
+                            else
+                                uram_wdata[i] = {1'b1, refractory_max_param, 32'd0,
+                                                 row_a_latched[i][35:0]};
+                            // Row B: spike → w += delta_w, trace = max
+                            psc_new_row_b_comb[i] = {psc_i_ex_decayed[i], psc_i_in_decayed[i],
+                                                      psc_w_decayed[i] + delta_w_param_in, 4'hF,
+                                                      uram_rmwdata[i][35:0]};
+                        end else begin
+                            // NO SPIKE
+                            uram_wdata[i] = {1'b0, 3'd0,
+                                $signed(row_a_latched[i][67:36]) - psc_leak_term_u[i]
+                                + coba_drive_ex_upper[i]
+                                + coba_drive_in_upper[i]
+                                - $signed({24'd0, psc_w_decayed[i]})
+                                + $signed(prbs_shift_signext[i][31:0]),
+                                row_a_latched[i][35:0]};
+                            // Row B: decay only, trace decrements
+                            psc_new_row_b_comb[i] = {psc_i_ex_decayed[i], psc_i_in_decayed[i], psc_w_decayed[i],
+                                                      (psc_rowb_trace[i] > 4'd0) ? psc_rowb_trace[i] - 4'd1 : 4'd0,
+                                                      uram_rmwdata[i][35:0]};
+                        end
+                    end
+                end else begin
+                    //--- EVEN ADDRESS: active neuron is lower half-word ---
+                    if (row_a_latched[i][34:32] > 3'd0) begin
+                        // Refractory
+                        uram_wdata[i] = {row_a_latched[i][71:36],
+                                         1'b0, row_a_latched[i][34:32] - 3'd1, row_a_latched[i][31:0]};
+                        psc_new_row_b_comb[i] = {uram_rmwdata[i][71:36],
+                                                  psc_i_ex_decayed[i], psc_i_in_decayed[i], psc_w_decayed[i],
+                                                  (psc_rowb_trace[i] > 4'd0) ? psc_rowb_trace[i] - 4'd1 : 4'd0};
+                    end else begin
+                        //-------------------------------------------------------------
+                        // EVEN neuron: same model, uses drive_ex_lower / drive_in_lower
+                        //-------------------------------------------------------------
+                        if (($signed(row_a_latched[i][31:0]) - psc_leak_term_l[i]
+                             + coba_drive_ex_lower[i]
+                             + coba_drive_in_lower[i]
+                             - $signed({24'd0, psc_w_decayed[i]})
+                             + $signed(prbs_shift_signext[i][31:0])
+                             > $signed(effective_threshold))
+                            && ({psc_saved_full_addr, i[3:0]} < num_outputs)) begin
+                            // SPIKE
+                            if (soft_reset_en_param)
+                                uram_wdata[i] = {row_a_latched[i][71:36],
+                                    1'b1, refractory_max_param,
+                                    $signed(row_a_latched[i][31:0]) - psc_leak_term_l[i]
+                                    + coba_drive_ex_lower[i]
+                                    + coba_drive_in_lower[i]
+                                    - $signed({24'd0, psc_w_decayed[i]})
+                                    + $signed(prbs_shift_signext[i][31:0])
+                                    - effective_threshold};
+                            else
+                                uram_wdata[i] = {row_a_latched[i][71:36],
+                                                 1'b1, refractory_max_param, 32'd0};
+                            psc_new_row_b_comb[i] = {uram_rmwdata[i][71:36],
+                                                      psc_i_ex_decayed[i], psc_i_in_decayed[i],
+                                                      psc_w_decayed[i] + delta_w_param_in, 4'hF};
+                        end else begin
+                            // NO SPIKE
+                            uram_wdata[i] = {row_a_latched[i][71:36],
+                                1'b0, 3'd0,
+                                $signed(row_a_latched[i][31:0]) - psc_leak_term_l[i]
+                                + coba_drive_ex_lower[i]
+                                + coba_drive_in_lower[i]
+                                - $signed({24'd0, psc_w_decayed[i]})
+                                + $signed(prbs_shift_signext[i][31:0])};
+                            psc_new_row_b_comb[i] = {uram_rmwdata[i][71:36],
+                                                      psc_i_ex_decayed[i], psc_i_in_decayed[i], psc_w_decayed[i],
+                                                      (psc_rowb_trace[i] > 4'd0) ? psc_rowb_trace[i] - 4'd1 : 4'd0};
+                        end
+                    end
+                end
+            end else begin
+            //=================================================================
+            // DELTA MODE (or psc_substate != 2): Original Phase 0 (UNCHANGED)
+            //=================================================================
+            if (uram_waddr[i][0]) begin
+                if (refrac_ctr_upper[i] > 3'd0) begin
+                    uram_wdata[i] = {1'b0, refrac_ctr_upper[i] - 3'd1, uram_rmwmem_upper[i][31:0], uram_rmwdata_lower[i]};
+                end else if (($signed(uram_rmwmem_upper[i][31:0]) > $signed(threshold_param[31:0])) && ({uram_waddr[i], i[3:0]} < num_outputs)) begin
+                    if (soft_reset_en_param)
+                        uram_wdata[i] = {1'b1, refractory_max_param, uram_rmwmem_upper[i][31:0] - threshold_param[31:0], uram_rmwdata_lower[i]};
+                    else
+                        uram_wdata[i] = {1'b1, refractory_max_param, 32'd0, uram_rmwdata_lower[i]};
+                end else begin
+                    if (exec_neuron_model_param==2'd0) begin
+                        uram_wdata[i] = {1'b0, 3'd0, 32'd0, uram_rmwdata_lower[i]};
+                    end else if (exec_neuron_model_param==2'd1) begin
+                        uram_wdata[i] = {1'b0, 3'd0, uram_rmwmem_upper[i][31:0] + 32'd1, uram_rmwdata_lower[i]};
+                    end else if (exec_neuron_model_param==2'd2) begin
+                        uram_wdata[i][71] = 1'b0;
+                        uram_wdata[i][70:68] = 3'd0;
+                        uram_wdata[i][67:36] = $signed(prbs_shift_signext[i][31:0]) + $signed(uram_rmwmem_upper[i][31:0]) - leak_term_upper[i]; 
+                        uram_wdata[i][35:0] = uram_rmwdata_lower[i]; 
+                    end else if (exec_neuron_model_param==2'd3) begin
+                        uram_wdata[i] = {1'b0, 3'd0, uram_rmwmem_upper[i][31:0], uram_rmwdata_lower[i]};
+                    end
+                end
+            end else begin
+                if (refrac_ctr_lower[i] > 3'd0) begin
+                    uram_wdata[i] = {uram_rmwdata_upper[i], 1'b0, refrac_ctr_lower[i] - 3'd1, uram_rmwmem_lower[i][31:0]};
+                end else if (($signed(uram_rmwmem_lower[i][31:0]) > $signed(threshold_param[31:0])) && ({uram_waddr[i], i[3:0]} < num_outputs)) begin
+                    if (soft_reset_en_param)
+                        uram_wdata[i] = {uram_rmwdata_upper[i], 1'b1, refractory_max_param, uram_rmwmem_lower[i][31:0] - threshold_param[31:0]};
+                    else
+                        uram_wdata[i] = {uram_rmwdata_upper[i], 1'b1, refractory_max_param, 32'd0};
+                end else begin
+                    if (exec_neuron_model_param==2'd0) begin
+                        uram_wdata[i] = {uram_rmwdata_upper[i], 1'b0, 3'd0, 32'd0};
+                    end else if (exec_neuron_model_param==2'd1) begin
+                        uram_wdata[i] = {uram_rmwdata_upper[i], 1'b0, 3'd0, uram_rmwmem_lower[i][31:0] + 32'd1};
+                    end else if (exec_neuron_model_param==2'd2) begin
+                        uram_wdata[i][71:36] = uram_rmwdata_upper[i]; 
+                        uram_wdata[i][35] = 1'b0; 
+                        uram_wdata[i][34:32] = 3'd0;
+                        uram_wdata[i][31:0] = $signed(prbs_shift_signext[i][31:0]) + $signed(uram_rmwmem_lower[i][31:0]) - leak_term_lower[i]; 
+                    end else if (exec_neuron_model_param==2'd3) begin
+                        uram_wdata[i] = {uram_rmwdata_upper[i], 1'b0, 3'd0, uram_rmwmem_lower[i][31:0]};
+                    end
+                end
+            end
+            end // delta_mode gate
+        end 
+    end else if (exec_uram_phase0_done && !exec_uram_phase1_done) begin
+        for (i = 0; i < NEURON_GROUPS; i=i+1) begin
+            if (uram_waddr[i][0]) begin
+                if (uram_rmwdata_upper[i][35]==1'b1) 
+                    // Clear spike bit [35], preserve refrac[34:32] and MP[31:0] via uram_rmwmem_upper[34:0]
+                    uram_wdata[i] = {1'b0,uram_rmwmem_upper[i], uram_rmwdata_lower[i]};
+                else 
+                    uram_wdata[i] = {uram_rmwdata_upper[i], uram_rmwdata_lower[i]};
+            end else begin
+                if (uram_rmwdata_lower[i][35]==1'b1) 
+                    uram_wdata[i] = {uram_rmwdata_upper[i], 1'b0, uram_rmwmem_lower[i]};
+                else 
+                    uram_wdata[i] = {uram_rmwdata_upper[i], uram_rmwdata_lower[i]};
+            end
+        end    
+    end else if (exec_uram_phase1_done) begin
+        for(i=0;i < NEURON_GROUPS; i=i+1) begin
+            //=================================================================
+            // EXP_PSC CHANGE 8: Phase 2 weight accumulation, gated by delta_mode
+            //=================================================================
+            if (delta_mode) begin
+            //-----------------------------------------------------------------
+            // DELTA MODE: MP += weight (original, unchanged)
+            //-----------------------------------------------------------------
+            if (uram_waddr[i][0]) begin
+                if (uram_rmwmem_upper[i][34:32] > 3'd0)
+                    uram_wdata[i] = {{1'b0, uram_rmwmem_upper[i][34:32], uram_rmwmem_upper[i][31:0]}, uram_rmwdata_lower[i]};
+                else
+                    uram_wdata[i] = {{1'b0, uram_rmwmem_upper[i][34:32], uram_rmwmem_upper[i][31:0] + exec_hbm_rdata_reg_signext[i][31:0]}, uram_rmwdata_lower[i]};
+            end else begin
+                if (uram_rmwmem_lower[i][34:32] > 3'd0)
+                    uram_wdata[i] = {uram_rmwdata_upper[i], {1'b0, uram_rmwmem_lower[i][34:32], uram_rmwmem_lower[i][31:0]}};
+                else
+                    uram_wdata[i] = {uram_rmwdata_upper[i], {1'b0, uram_rmwmem_lower[i][34:32], uram_rmwmem_lower[i][31:0] + exec_hbm_rdata_reg_signext[i][31:0]}};
+            end
+            //-----------------------------------------------------------------
+            end else begin
+            //-----------------------------------------------------------------
+            // EXP_PSC MODE: Accumulate into Row B I_ex or I_in
+            // Address already offset by Change 4b, so uram_rmwdata holds Row B.
+            // No refractory check - currents accumulate during refractory
+            // (biologically accurate; V held at reset in Phase 0 anyway).
+            // weight >= 0: I_ex += weight[11:0]
+            // weight <  0: I_in += weight[11:0]
+            //-----------------------------------------------------------------
+            if (uram_waddr[i][0]) begin
+                // ODD: active neuron in upper half-word of Row B
+                if (exec_hbm_rdata_reg_signext[i][34] == 1'b0) begin
+                    // Excitatory: I_ex += weight[11:0]
+                    uram_wdata[i] = {
+                        uram_rmwdata_upper[i][35:24] + exec_hbm_rdata_reg_signext[i][11:0],
+                        uram_rmwdata_upper[i][23:0],
+                        uram_rmwdata_lower[i]};
+                end else begin
+                    // Inhibitory: I_in += weight[11:0]
+                    uram_wdata[i] = {
+                        uram_rmwdata_upper[i][35:24],
+                        uram_rmwdata_upper[i][23:12] + exec_hbm_rdata_reg_signext[i][11:0],
+                        uram_rmwdata_upper[i][11:0],
+                        uram_rmwdata_lower[i]};
+                end
+            end else begin
+                // EVEN: active neuron in lower half-word of Row B
+                if (exec_hbm_rdata_reg_signext[i][34] == 1'b0) begin
+                    uram_wdata[i] = {
+                        uram_rmwdata_upper[i],
+                        uram_rmwdata_lower[i][35:24] + exec_hbm_rdata_reg_signext[i][11:0],
+                        uram_rmwdata_lower[i][23:0]};
+                end else begin
+                    uram_wdata[i] = {
+                        uram_rmwdata_upper[i],
+                        uram_rmwdata_lower[i][35:24],
+                        uram_rmwdata_lower[i][23:12] + exec_hbm_rdata_reg_signext[i][11:0],
+                        uram_rmwdata_lower[i][11:0]};
+                end
+            end
+            //-----------------------------------------------------------------
+            end
+        end
+    end
+end
+
+always @(posedge clk) begin
+    if ((curr_state==STATE_READ_URAM_0) | (curr_state==STATE_READ_URAM_1) | (curr_state==STATE_WRITE_URAM_0)) begin
+        uram_wren[0] <= 1'b0;
+        uram_wren[1] <= 1'b0;
+        uram_wren[2] <= 1'b0;
+        uram_wren[3] <= 1'b0;
+        uram_wren[4] <= 1'b0;
+        uram_wren[5] <= 1'b0;
+        uram_wren[6] <= 1'b0;
+        uram_wren[7] <= 1'b0;
+        uram_wren[8] <= 1'b0;
+        uram_wren[9] <= 1'b0;
+        uram_wren[10] <= 1'b0;
+        uram_wren[11] <= 1'b0;
+        uram_wren[12] <= 1'b0;
+        uram_wren[13] <= 1'b0;
+        uram_wren[14] <= 1'b0;
+        uram_wren[15] <= 1'b0;
+    end else begin
+        //=================================================================
+        // EXP_PSC CHANGE 6: uram_wren override for delta_mode=0 Phase 0
+        // psc_suppress_wren (sub 1): suppress auto write
+        // psc_manual_wren (subs 2,3): force write for Row A / Row B
+        //=================================================================
+        if (psc_phase0_active && !psc_wren_next) begin
+            uram_wren[0] = 1'b0;
+            uram_wren[1] = 1'b0;
+            uram_wren[2] = 1'b0;
+            uram_wren[3] = 1'b0;
+            uram_wren[4] = 1'b0;
+            uram_wren[5] = 1'b0;
+            uram_wren[6] = 1'b0;
+            uram_wren[7] = 1'b0;
+            uram_wren[8] = 1'b0;
+            uram_wren[9] = 1'b0;
+            uram_wren[10] = 1'b0;
+            uram_wren[11] = 1'b0;
+            uram_wren[12] = 1'b0;
+            uram_wren[13] = 1'b0;
+            uram_wren[14] = 1'b0;
+            uram_wren[15] = 1'b0;
+        end else if (psc_phase0_active && psc_wren_next) begin
+            uram_wren[0] = 1'b1;
+            uram_wren[1] = 1'b1;
+            uram_wren[2] = 1'b1;
+            uram_wren[3] = 1'b1;
+            uram_wren[4] = 1'b1;
+            uram_wren[5] = 1'b1;
+            uram_wren[6] = 1'b1;
+            uram_wren[7] = 1'b1;
+            uram_wren[8] = 1'b1;
+            uram_wren[9] = 1'b1;
+            uram_wren[10] = 1'b1;
+            uram_wren[11] = 1'b1;
+            uram_wren[12] = 1'b1;
+            uram_wren[13] = 1'b1;
+            uram_wren[14] = 1'b1;
+            uram_wren[15] = 1'b1;
+        end else begin
+        uram_wren[0] = uram_rden_0;
+        uram_wren[1] = uram_rden_1;
+        uram_wren[2] = uram_rden_2;
+        uram_wren[3] = uram_rden_3;
+        uram_wren[4] = uram_rden_4;
+        uram_wren[5] = uram_rden_5;
+        uram_wren[6] = uram_rden_6;
+        uram_wren[7] = uram_rden_7;
+        uram_wren[8] = uram_rden_8;
+        uram_wren[9] = uram_rden_9;
+        uram_wren[10] = uram_rden_10;
+        uram_wren[11] = uram_rden_11;
+        uram_wren[12] = uram_rden_12;
+        uram_wren[13] = uram_rden_13;
+        uram_wren[14] = uram_rden_14;
+        uram_wren[15] = uram_rden_15;
+        end
+    end
+end
+
+assign uram_wren_0  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd0)  : uram_wren[0];
+assign uram_wren_1  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd1)  : uram_wren[1];
+assign uram_wren_2  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd2)  : uram_wren[2];
+assign uram_wren_3  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd3)  : uram_wren[3];
+assign uram_wren_4  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd4)  : uram_wren[4];
+assign uram_wren_5  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd5)  : uram_wren[5];
+assign uram_wren_6  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd6)  : uram_wren[6];
+assign uram_wren_7  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd7)  : uram_wren[7];
+assign uram_wren_8  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd8)  : uram_wren[8];
+assign uram_wren_9  = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd9)  : uram_wren[9];
+assign uram_wren_10 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd10) : uram_wren[10];
+assign uram_wren_11 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd11) : uram_wren[11];
+assign uram_wren_12 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd12) : uram_wren[12];
+assign uram_wren_13 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd13) : uram_wren[13];
+assign uram_wren_14 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd14) : uram_wren[14];
+assign uram_wren_15 = (curr_state==STATE_INIT_URAM) ? 1'b1 : (curr_state==STATE_WRITE_URAM) ? (SET_GROUP_reg==4'd15) : uram_wren[15];
+
+reg [3:0] wait_cycle_neuron_param_mem; 
+reg wait_cycle_neuron_param_rst;
+reg wait_cycle_neuron_param_inc;
+reg rd_addr_neuron_param_rst;
+reg rd_addr_neuron_param_inc;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        wait_cycle_neuron_param_mem <= 4'd0;
+        rd_addr_neuron_param_mem <= 4'b0;
+    end else begin
+        if(wait_cycle_neuron_param_rst) wait_cycle_neuron_param_mem <= 4'd0;
+        if(rd_addr_neuron_param_rst) rd_addr_neuron_param_mem <= 4'b0;
+        if (wait_cycle_neuron_param_inc) wait_cycle_neuron_param_mem <= wait_cycle_neuron_param_mem + 1'b1;  
+        if(rd_addr_neuron_param_inc) rd_addr_neuron_param_mem <= rd_addr_neuron_param_mem + 1'b1;
+    end
+end
+
+always @(*) begin
+    uram_rden     <= 1'b0;
+    uram_addr_rst <= 1'b0;
+    uram_addr_inc <= 1'b0;
+    uram_init_wren <= 1'b0;
+    
+    ci2iep_rden <= 1'b0;
+    iep2ci_wren <= 1'b0;
+    
+    next_state <= curr_state;
+    
+    wait_cycle_neuron_param_rst <= 1'b0;
+    wait_cycle_neuron_param_inc <= 1'b0;
+    rd_addr_neuron_param_rst <= 1'b0;
+    rd_addr_neuron_param_inc <= 1'b0;
+    
+    case (curr_state)
+        STATE_RESET: begin
+            uram_addr_rst <= 1'b1;
+            wait_cycle_neuron_param_rst <= 1'b1;
+            rd_addr_neuron_param_rst <= 1'b1;
+            next_state <= STATE_INIT_URAM;
+        end
+        
+        STATE_INIT_URAM: begin
+            uram_init_wren <= 1'b1;
+            if (uram_init_done) begin
+                uram_init_wren <= 1'b0;
+                if (uram_reinit_active) begin
+                    // Reinit complete: proceed to process the timestep
+                    uram_addr_rst <= 1'b1;
+                    wait_cycle_neuron_param_rst <= 1'b1;
+                    rd_addr_neuron_param_rst <= 1'b1;
+                    next_state <= STATE_PHASE0_READ_SPIKES;
+                end else begin
+                    // Power-on init: go to idle
+                    next_state <= STATE_IDLE;
+                end
+            end
+        end
+        
+        STATE_IDLE: begin
+            if (exec_run && uram_reinit_needed) begin
+                // New network detected: clear all URAMs before processing first timestep
+                uram_addr_rst <= 1'b1;
+                next_state <= STATE_INIT_URAM;
+            end else if (exec_run) begin
+                uram_addr_rst <= 1'b1;
+                wait_cycle_neuron_param_rst <= 1'b1;
+                rd_addr_neuron_param_rst <= 1'b1;
+                next_state <= STATE_PHASE0_READ_SPIKES;
+            end else if (exec_uram_phase2_done & ~ci2iep_empty) begin
+                if (ci2iep_dout[53] == 1'b0)
+                    next_state <= STATE_READ_URAM_0;
+                else
+                    next_state <= STATE_WRITE_URAM_0;
+            end
+        end
+        STATE_READ_URAM_0: begin
+            uram_rden <= 1'b1;
+            next_state <= STATE_READ_URAM_1;
+        end
+        STATE_READ_URAM_1: begin
+            if (~iep2ci_full) begin
+                iep2ci_wren <= 1'b1;
+                ci2iep_rden <= 1'b1;
+                next_state <= STATE_IDLE;
+            end
+        end
+        STATE_WRITE_URAM_0: begin
+            uram_rden <= 1'b1;
+            next_state <= STATE_WRITE_URAM;
+        end
+        STATE_WRITE_URAM: begin
+            ci2iep_rden <= 1'b1;
+            next_state <= STATE_IDLE;
+        end
+        STATE_PHASE0_READ_SPIKES: begin
+            //=================================================================
+            // EXP_PSC CHANGE 9: Sub-state gated advancement
+            //=================================================================
+            if (delta_mode) begin
+            //----- DELTA MODE: original single-cycle logic -----
+            if((((uram_raddr_0_full != 0) && uram_raddr_0_full == dout_neuron_param_mem[33:21]) && (wait_cycle_neuron_param_mem == 0))) begin
+                if (uram_raddr_0_full == URAM_ADDR_LIMIT) begin
+                      uram_addr_inc <= 1'b1;
+                      uram_rden <= 1'b1;
+                      next_state <= STATE_PHASE0_DONE;
+                end else begin
+                    rd_addr_neuron_param_inc <= 1'b1;
+                    wait_cycle_neuron_param_inc <= 1'b1;
+                end
+            end else if ((wait_cycle_neuron_param_mem != 0) && (wait_cycle_neuron_param_mem < 4)) begin
+                wait_cycle_neuron_param_inc <= 1'b1;
+            end else begin
+                wait_cycle_neuron_param_rst <= 1'b1;
+                uram_addr_inc <= 1'b1;
+                uram_rden <= 1'b1;
+                if (uram_waddr[0] == URAM_ADDR_LIMIT)
+                      next_state <= STATE_PHASE0_DONE;
+            end
+            //----- END DELTA MODE -----
+            end else begin
+            //----- EXP_PSC MODE: 5-cycle sub-state machine (pipelined decay) -----
+            case (psc_substate)
+                3'd0: begin
+                    // Sub 0: Issue Row A read (same boundary logic as delta mode)
+                    if((((uram_raddr_0_full != 0) && uram_raddr_0_full == dout_neuron_param_mem[33:21]) && (wait_cycle_neuron_param_mem == 0))) begin
+                        if (uram_raddr_0_full == URAM_ADDR_LIMIT_EFF) begin
+                            uram_rden <= 1'b1;
+                        end else begin
+                            rd_addr_neuron_param_inc <= 1'b1;
+                            wait_cycle_neuron_param_inc <= 1'b1;
+                        end
+                    end else if ((wait_cycle_neuron_param_mem != 0) && (wait_cycle_neuron_param_mem < 4)) begin
+                        wait_cycle_neuron_param_inc <= 1'b1;
+                    end else begin
+                        wait_cycle_neuron_param_rst <= 1'b1;
+                        uram_rden <= 1'b1;
+                    end
+                end
+                3'd1: begin
+                    // Sub 1: Row B read (address overridden by Change 4a)
+                    uram_rden <= 1'b1;
+                end
+                3'd2: begin
+                    // Sub 2: Decay DSPs compute. Pipeline registers loaded.
+                    // No state machine outputs needed
+                end
+                3'd3: begin
+                    // Sub 3: Pipelined COBA + neuron model + Row A write
+                    // No state machine outputs needed (write via psc_manual_wren)
+                end
+                3'd4: begin
+                    // Sub 4: Row B write. Advance address.
+                    uram_addr_inc <= 1'b1;
+                    if (psc_addr_counter_iso == URAM_ADDR_LIMIT_EFF)
+                        next_state <= STATE_PHASE0_DONE;
+                end
+            endcase
+            //----- END EXP_PSC MODE -----
+            end
+        end
+        STATE_PHASE0_DONE: begin
+            next_state <= STATE_PHASE0_DONE_WAIT;
+            rd_addr_neuron_param_rst <= 1'b1;
+            uram_addr_rst <= 1'b1;
+        end
+        STATE_PHASE0_DONE_WAIT: begin
+            next_state <= STATE_FILL_PIPE_PHASE1;
+        end
+        STATE_FILL_PIPE_PHASE1: begin
+            if (uram_raddr < 14'd1) begin
+                uram_rden <= 1'b1;
+                uram_addr_inc <= 1'b1;
+            end else begin
+                next_state <= STATE_WAIT_BRAM_PHASE1_DONE;
+            end
+        end
+        
+        STATE_WAIT_BRAM_PHASE1_DONE: begin
+            if (exec_bram_phase1_done) begin
+                    next_state <= STATE_PUSH_PTR_FIFO;
+            end else if (iep_phase1_timeout == 11'd2047)
+                next_state <= STATE_PUSH_PTR_FIFO;
+        end
+        STATE_PUSH_PTR_FIFO: begin
+            if (exec_hbm_rvalidready) begin
+                uram_addr_inc <= 1'b1;
+                if (uram_waddr[0] == microphase_ctr * 512 + uram_microphase_addr_limit) begin
+                    next_state <= STATE_PHASE1_DONE;
+                end else
+                    uram_rden <= 1'b1;
+            end else if (iep_phase1_timeout == 11'd2047) begin
+                // Absolute timeout: 2048 cycles in STATE_PUSH_PTR_FIFO, skip to done
+                next_state <= STATE_PHASE1_DONE;
+            end
+        end
+        STATE_PHASE1_DONE: begin
+            if (syn_64bit_en && !dbuf_drain_done && drain_timeout != 10'h3FF) begin   // FIX I
+                next_state <= STATE_PHASE1_DONE;
+                if (drain_sub == 3'd3) uram_rden <= 1'b1;
+            end else begin
+                next_state <= STATE_POP_PTR_FIFO;
+            end
+        end
+        STATE_POP_PTR_FIFO: begin
+            if (exec_hbm_rvr_p2) begin   // FIX G
+                uram_rden <= 1'b1;
+            end
+            else if (exec_hbm_rx_phase2_done)
+                next_state <= STATE_PHASE2_DONE;
+            else if (iep_phase1_timeout == 11'd2047)
+                next_state <= STATE_PHASE2_DONE;
+        end
+        STATE_PHASE2_DONE: begin
+            if(microphase_ctr == MICROPHASE_LIMIT) next_state <= STATE_IDLE;
+            else next_state <= STATE_WAIT_BRAM_PHASE1_DONE;
+        end
+        default: begin
+            next_state <= STATE_RESET;
+        end
+    endcase
+end
+
+always @(*) begin
+    case (SET_GROUP_reg)
+        4'd0: iep2ci_din <= (uram_raddr_0_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[0]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[0]};
+        4'd1: iep2ci_din <= (uram_raddr_1_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[1]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[1]};
+        4'd2: iep2ci_din <= (uram_raddr_2_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[2]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[2]};
+        4'd3: iep2ci_din <= (uram_raddr_3_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[3]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[3]};
+        4'd4: iep2ci_din <= (uram_raddr_4_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[4]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[4]};
+        4'd5: iep2ci_din <= (uram_raddr_5_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[5]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[5]};
+        4'd6: iep2ci_din <= (uram_raddr_6_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[6]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[6]};
+        4'd7: iep2ci_din <= (uram_raddr_7_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[7]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[7]};
+        4'd8: iep2ci_din <= (uram_raddr_8_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[8]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[8]};
+        4'd9: iep2ci_din <= (uram_raddr_9_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[9]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[9]};
+        4'd10: iep2ci_din <= (uram_raddr_10_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[10]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[10]};
+        4'd11: iep2ci_din <= (uram_raddr_11_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[11]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[11]};
+        4'd12: iep2ci_din <= (uram_raddr_12_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[12]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[12]};
+        4'd13: iep2ci_din <= (uram_raddr_13_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[13]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[13]};
+        4'd14: iep2ci_din <= (uram_raddr_14_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[14]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[14]};
+        4'd15: iep2ci_din <= (uram_raddr_15_full_reg[0])? {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_upper[15]}:{SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[15]};
+        default: iep2ci_din <= {SET_GROUP_reg,SET_ROW_reg,uram_rmwdata_lower[0]};
+    endcase
+end
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        exec_uram_phase1_ready <= 1'b0;
+        exec_uram_phase0_done  <= 1'b1;
+        exec_uram_phase1_done  <= 1'b1;
+        exec_uram_phase2_done  <= 1'b1;
+    end else if (exec_run) begin
+        exec_uram_phase1_ready <= 1'b0;
+        exec_uram_phase0_done  <= 1'b0;
+        exec_uram_phase1_done  <= 1'b0;
+        exec_uram_phase2_done  <= 1'b0;
+    end else if (curr_state == STATE_IDLE) begin
+        microphase_ctr <= 4'b0;
+        exec_uram_phase1_ready <= 1'b0;
+        exec_uram_phase0_done  <= 1'b1;
+        exec_uram_phase1_done  <= 1'b1;
+        exec_uram_phase2_done  <= 1'b1;
+    end else if (curr_state == STATE_WAIT_BRAM_PHASE1_DONE) begin
+        exec_uram_phase1_ready <= 1'b0;
+        exec_uram_phase1_done  <= 1'b0;
+        exec_uram_phase2_done  <= 1'b0;
+    end else if (curr_state == STATE_FILL_PIPE_PHASE1) 
+        exec_uram_phase0_done  <= 1'b1;
+    else if (curr_state == STATE_PUSH_PTR_FIFO)
+        exec_uram_phase1_ready <= 1'b1;
+    else if (curr_state == STATE_PHASE1_DONE) begin
+        exec_uram_phase1_done  <= 1'b1;
+        exec_uram_phase1_ready <= 1'b0;
+    end else if (curr_state == STATE_PHASE2_DONE) begin
+        exec_uram_phase2_done  <= 1'b1;
+        if (microphase_ctr != MICROPHASE_LIMIT) microphase_ctr <= microphase_ctr+1'b1;
+    end
+end
+
+always @(*) begin
+    if (exec_uram_phase1_ready & !exec_uram_phase1_done) begin
+        exec_uram_spiked[0] = (~uram_raddr_0_full[0])? (uram_rmwdata_upper[0][35]):(uram_rmwdata_lower[0][35]);
+        exec_uram_spiked[1] = (~uram_raddr_1_full[0])? (uram_rmwdata_upper[1][35]):(uram_rmwdata_lower[1][35]);
+        exec_uram_spiked[2] = (~uram_raddr_2_full[0])? (uram_rmwdata_upper[2][35]):(uram_rmwdata_lower[2][35]);
+        exec_uram_spiked[3] = (~uram_raddr_3_full[0])? (uram_rmwdata_upper[3][35]):(uram_rmwdata_lower[3][35]);
+        exec_uram_spiked[4] = (~uram_raddr_4_full[0])? (uram_rmwdata_upper[4][35]):(uram_rmwdata_lower[4][35]);
+        exec_uram_spiked[5] = (~uram_raddr_5_full[0])? (uram_rmwdata_upper[5][35]):(uram_rmwdata_lower[5][35]);
+        exec_uram_spiked[6] = (~uram_raddr_6_full[0])? (uram_rmwdata_upper[6][35]):(uram_rmwdata_lower[6][35]);
+        exec_uram_spiked[7] = (~uram_raddr_7_full[0])? (uram_rmwdata_upper[7][35]):(uram_rmwdata_lower[7][35]);
+        exec_uram_spiked[8] = (~uram_raddr_8_full[0])? (uram_rmwdata_upper[8][35]):(uram_rmwdata_lower[8][35]);
+        exec_uram_spiked[9] = (~uram_raddr_9_full[0])? (uram_rmwdata_upper[9][35]):(uram_rmwdata_lower[9][35]);
+        exec_uram_spiked[10] = (~uram_raddr_10_full[0])? (uram_rmwdata_upper[10][35]):(uram_rmwdata_lower[10][35]);
+        exec_uram_spiked[11] = (~uram_raddr_11_full[0])? (uram_rmwdata_upper[11][35]):(uram_rmwdata_lower[11][35]);
+        exec_uram_spiked[12] = (~uram_raddr_12_full[0])? (uram_rmwdata_upper[12][35]):(uram_rmwdata_lower[12][35]);
+        exec_uram_spiked[13] = (~uram_raddr_13_full[0])? (uram_rmwdata_upper[13][35]):(uram_rmwdata_lower[13][35]);
+        exec_uram_spiked[14] = (~uram_raddr_14_full[0])? (uram_rmwdata_upper[14][35]):(uram_rmwdata_lower[14][35]);
+        exec_uram_spiked[15] = (~uram_raddr_15_full[0])? (uram_rmwdata_upper[15][35]):(uram_rmwdata_lower[15][35]);
+        // Ghost neuron masking: suppress spikes from neuron addresses >= num_outputs
+        // Use uram_waddr (matches the data in uram_rmwdata) not uram_raddr_i_full (which is 1 ahead)
+        if ({uram_waddr[0], 4'd0} >= num_outputs) exec_uram_spiked[0] = 1'b0;
+        if ({uram_waddr[1], 4'd1} >= num_outputs) exec_uram_spiked[1] = 1'b0;
+        if ({uram_waddr[2], 4'd2} >= num_outputs) exec_uram_spiked[2] = 1'b0;
+        if ({uram_waddr[3], 4'd3} >= num_outputs) exec_uram_spiked[3] = 1'b0;
+        if ({uram_waddr[4], 4'd4} >= num_outputs) exec_uram_spiked[4] = 1'b0;
+        if ({uram_waddr[5], 4'd5} >= num_outputs) exec_uram_spiked[5] = 1'b0;
+        if ({uram_waddr[6], 4'd6} >= num_outputs) exec_uram_spiked[6] = 1'b0;
+        if ({uram_waddr[7], 4'd7} >= num_outputs) exec_uram_spiked[7] = 1'b0;
+        if ({uram_waddr[8], 4'd8} >= num_outputs) exec_uram_spiked[8] = 1'b0;
+        if ({uram_waddr[9], 4'd9} >= num_outputs) exec_uram_spiked[9] = 1'b0;
+        if ({uram_waddr[10], 4'd10} >= num_outputs) exec_uram_spiked[10] = 1'b0;
+        if ({uram_waddr[11], 4'd11} >= num_outputs) exec_uram_spiked[11] = 1'b0;
+        if ({uram_waddr[12], 4'd12} >= num_outputs) exec_uram_spiked[12] = 1'b0;
+        if ({uram_waddr[13], 4'd13} >= num_outputs) exec_uram_spiked[13] = 1'b0;
+        if ({uram_waddr[14], 4'd14} >= num_outputs) exec_uram_spiked[14] = 1'b0;
+        if ({uram_waddr[15], 4'd15} >= num_outputs) exec_uram_spiked[15] = 1'b0;
+    end else
+        exec_uram_spiked = 16'd0;
+end
+
+//=========================================================================
+// STDP: Spike address capture during Phase 0
+//
+// When a neuron's V exceeds threshold in Phase 0, we capture its full
+// address (group + row) for the stdp_controller. The controller uses
+// these addresses in Phase 4 to re-read synapse lists from HBM.
+//
+// Capture happens in the same cycle as spike detection. We scan all 16
+// groups and output one spike address per cycle via round-robin priority.
+// For typical firing rates (~1% of neurons), this is not a bottleneck.
+//=========================================================================
+reg [3:0] stdp_scan_group;
+
+always @(posedge clk) begin
+    if (~resetn || curr_state != STATE_PHASE0_READ_SPIKES) begin
+        stdp_spike_wr <= 1'b0;
+        stdp_spike_addr <= 17'd0;
+        stdp_scan_group <= 4'd0;
+    end else begin
+        stdp_spike_wr <= 1'b0;  // default: no write
+
+        // During Phase 0, after uram_wdata is computed, check if any group spiked
+        // We use exec_uram_spiked which is set combinationally from the spike bits
+        if (uram_rden && exec_uram_spiked != 16'd0) begin
+            // Round-robin: find next spiking group starting from stdp_scan_group
+            // For simplicity, scan group 0 first each cycle
+            if      (exec_uram_spiked[0])  begin stdp_spike_addr <= {uram_waddr[0],  4'd0};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[1])  begin stdp_spike_addr <= {uram_waddr[1],  4'd1};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[2])  begin stdp_spike_addr <= {uram_waddr[2],  4'd2};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[3])  begin stdp_spike_addr <= {uram_waddr[3],  4'd3};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[4])  begin stdp_spike_addr <= {uram_waddr[4],  4'd4};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[5])  begin stdp_spike_addr <= {uram_waddr[5],  4'd5};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[6])  begin stdp_spike_addr <= {uram_waddr[6],  4'd6};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[7])  begin stdp_spike_addr <= {uram_waddr[7],  4'd7};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[8])  begin stdp_spike_addr <= {uram_waddr[8],  4'd8};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[9])  begin stdp_spike_addr <= {uram_waddr[9],  4'd9};  stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[10]) begin stdp_spike_addr <= {uram_waddr[10], 4'd10}; stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[11]) begin stdp_spike_addr <= {uram_waddr[11], 4'd11}; stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[12]) begin stdp_spike_addr <= {uram_waddr[12], 4'd12}; stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[13]) begin stdp_spike_addr <= {uram_waddr[13], 4'd13}; stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[14]) begin stdp_spike_addr <= {uram_waddr[14], 4'd14}; stdp_spike_wr <= 1'b1; end
+            else if (exec_uram_spiked[15]) begin stdp_spike_addr <= {uram_waddr[15], 4'd15}; stdp_spike_wr <= 1'b1; end
+        end
+    end
+end
+
+assign hbm2iep_rden = exec_hbm_rvr_p2;   // FIX G
+assign curr_uram_waddr = uram_waddr[0];
+
+endmodule

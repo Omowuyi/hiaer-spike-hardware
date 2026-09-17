@@ -1,0 +1,789 @@
+`timescale 1ns / 1ps
+
+////////////////////////////////////////////////////////
+// External input and internal neuron in multiples of 8:
+// assign hbm_araddr = ~tx_phase ? {5'd0, {8'd0, tx_select, tx_addr, 4'd0}, 5'd0} : {5'd0, ptr_addr, 5'd0};
+//  -phase=0: push into pointer FIFO, synchronously reading neurons states (BRAM or URAM) and pointers (HBM)
+//    addressing: {5'd0, {8'd0, tx_select, tx_addr, 4'd0}, 5'd0}
+//                             |          |        |      |-> 32b pointers = 8 pointers / HBM row (= 3 address bits)
+//                             |          |        |-> max burst length = 16, set # of inputs (or neurons) as multiple of 16x8 (= 3+4 address bits) 
+//                             |          |-> 10b address, totaling 3+4+10=17 bits of external inputs
+//                             |-> 1b: 0=external inputs, 1=internal neurons
+//  -phase=1: pop pointer FIFO
+
+module hbm_processor #(
+    parameter HBM_ADDR_BITS  = 33,
+    parameter HBM_DATA_WIDTH = 256,
+    parameter HBM_BYTE_COUNT = 32
+    )(
+    input resetn,
+    input clk,
+    
+    input  [16:0] num_inputs,   // number of inputs to cycle through
+    input  [16:0] num_outputs,  // number of outputs to cycle through
+    input [4:0] core_number,
+        
+//    // for debugging
+//    output          vio_rvalid,
+//    output          vio_arready,
+//    output  [3:0]   vio_tx_state,
+//    output  [3:0]   vio_rx_state,
+//    output [22:0]   vio_ptr_addr,
+//    output  [8:0]   vio_ptr_len,
+//    output  [8:0]   vio_ptr_ctr,
+//    output  [3:0]   vio_ptr_burst,
+//    output [22:0]   vio_tx_ptr_ctr,
+//    output [22:0]   vio_rx_ptr_ctr,
+    
+    // from CPU, BRAM, and URAM
+    input  exec_run,                // start processing (i.e. new algorithm time step)
+    input  exec_bram_phase1_ready,  // input from BRAM indicating its pipeline has been filled
+    input  exec_uram_phase1_ready,  // input from URAM indicating its pipeline has been filled
+    output exec_hbm_rvalidready,
+    output exec_hbm_tx_phase1_done,
+    output exec_hbm_tx_phase2_done,
+    output exec_hbm_rx_phase1_done,
+    output exec_hbm_rx_phase2_done,
+    //output [255:0] exec_hbm_rdata,
+    output [511:0] exec_hbm_rdata,  //512b data packet for 16 neurons
+    
+    input                 hbmFIFO_full, //rden for 512b HBMFIFO. 
+    //hbm2iep_din is already assigned into exec_hbm_rdata at top wrapper.
+    //hbm2iep_wren is already assigned to exec_hbm_rvalid_rready at top wrapper.
+    
+    // Pointer FIFO
+    input        ptrFIFO_empty,
+    input [31:0] ptrFIFO_dout,
+    output reg   ptrFIFO_rden,
+    
+    // Interface with Command Interpreter
+    input                       ci2hbm_empty,
+    input          [1+23+255:0] ci2hbm_dout,       // [279]=r/w; [278:256]=address; [255:0]=data
+    output reg                  ci2hbm_rden,
+    input                       hbm2ci_full,
+    output            [255:0]   hbm2ci_din,
+    output reg                  hbm2ci_wren,
+    
+    // HBM
+    // Read data
+    //output  [HBM_ADDR_BITS-1:0] hbm_araddr,
+    //output reg [HBM_ADDR_BITS-1:0] hbm_araddr,   // for debugging
+    output reg [HBM_ADDR_BITS-1:0] hbm_araddr, 
+    output                [1:0] hbm_arburst,
+    output                [5:0] hbm_arid,
+    output reg            [3:0] hbm_arlen,
+    input                       hbm_arready,
+    output                [2:0] hbm_arsize,
+    output reg                  hbm_arvalid,
+    // Write address
+    output  [HBM_ADDR_BITS-1:0] hbm_awaddr,
+    output                [1:0] hbm_awburst,
+    output                [5:0] hbm_awid,
+    output                [3:0] hbm_awlen,
+    input                       hbm_awready,
+    output                [2:0] hbm_awsize,
+    output reg                  hbm_awvalid,
+    // Write response
+    input                 [5:0] hbm_bid,
+    output reg                  hbm_bready,
+    input                 [1:0] hbm_bresp,
+    input                       hbm_bvalid,
+    // Read response
+    input  [HBM_DATA_WIDTH-1:0] hbm_rdata,
+    input                 [5:0] hbm_rid,
+    input                       hbm_rlast,
+    output reg                  hbm_rready,
+    input                 [1:0] hbm_rresp,
+    input                       hbm_rvalid,
+    // Write data
+    output [HBM_DATA_WIDTH-1:0] hbm_wdata,
+    output                      hbm_wlast,
+    input                       hbm_wready,
+    output [HBM_BYTE_COUNT-1:0] hbm_wstrb,
+    output reg                  hbm_wvalid,
+    
+    // Spike FIFOs
+    input         spk0_full,
+    output [16:0] spk0_din,
+    output        spk0_wren,
+
+    input         spk1_full,
+    output [16:0] spk1_din,
+    output        spk1_wren,
+
+    input         spk2_full,
+    output [16:0] spk2_din,
+    output        spk2_wren,
+
+    input         spk3_full,
+    output [16:0] spk3_din,
+    output        spk3_wren,
+
+    input         spk4_full,
+    output [16:0] spk4_din,
+    output        spk4_wren,
+
+    input         spk5_full,
+    output [16:0] spk5_din,
+    output        spk5_wren,
+
+    input         spk6_full,
+    output [16:0] spk6_din,
+    output        spk6_wren,
+
+    input         spk7_full,
+    output [16:0] spk7_din,
+    output        spk7_wren,
+    
+    // High for one cycle whenever a spike was discarded because its
+    // per-group FIFO was full.  Detection only; spk*_wren is unchanged.
+    output          spk_dropped,
+
+    output   [3:0]  hbm_curr_state    //To VIO,
+    
+);
+
+wire exec_hbm_rvalidready_2x; //rvalidrready At speed of HBM
+assign spk0_din  = hbm_rdata[016:000];
+assign spk1_din  = hbm_rdata[048:032];
+assign spk2_din  = hbm_rdata[080:064];
+assign spk3_din  = hbm_rdata[112:096];
+assign spk4_din  = hbm_rdata[144:128];
+assign spk5_din  = hbm_rdata[176:160];
+assign spk6_din  = hbm_rdata[208:192];
+assign spk7_din  = hbm_rdata[240:224];
+
+assign spk0_wren = !spk0_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[031];
+assign spk1_wren = !spk1_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[063];
+assign spk2_wren = !spk2_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[095];
+assign spk3_wren = !spk3_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[127];
+assign spk4_wren = !spk4_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[159];
+assign spk5_wren = !spk5_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[191];
+assign spk6_wren = !spk6_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[223];
+assign spk7_wren = !spk7_full & exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x & hbm_rdata[255];
+
+// A spike was produced but its FIFO was full -- it is being discarded.
+wire spk_attempt = exec_hbm_rx_phase1_done & exec_hbm_rvalidready_2x;
+assign spk_dropped =
+    (spk_attempt & spk0_full & hbm_rdata[031]) |
+    (spk_attempt & spk1_full & hbm_rdata[063]) |
+    (spk_attempt & spk2_full & hbm_rdata[095]) |
+    (spk_attempt & spk3_full & hbm_rdata[127]) |
+    (spk_attempt & spk4_full & hbm_rdata[159]) |
+    (spk_attempt & spk5_full & hbm_rdata[191]) |
+    (spk_attempt & spk6_full & hbm_rdata[223]) |
+    (spk_attempt & spk7_full & hbm_rdata[255]);
+
+
+// Backpressure: stall HBM reads if ANY spike FIFO is full during phase 2
+wire any_spk_full = spk0_full | spk1_full | spk2_full | spk3_full |
+                    spk4_full | spk5_full | spk6_full | spk7_full;
+
+//////////////////
+// DECLARATIONS //
+//////////////////
+
+
+wire [3:0] MICROPHASE_LIMIT_INPUTS = num_inputs[16:13]+1;  //Added 1, so that we can monitor the microphase count in the FSM, not possible if it starts from 0.
+wire [9:0] MICROPHASE_MOD_INPUTS = num_inputs[12:3];
+wire [3:0] MICROPHASE_LIMIT_OUTPUTS = num_outputs[16:13]+1;
+wire [9:0] MICROPHASE_MOD_OUTPUTS = num_outputs[12:3];
+
+wire [9:0] tx_input_microphase_addr_limit;
+wire [9:0] tx_output_microphase_addr_limit;
+wire [9:0] rx_input_microphase_addr_limit;
+wire [9:0] rx_output_microphase_addr_limit;
+
+reg [3:0] tx_input_microphase_ctr;
+reg [3:0] tx_output_microphase_ctr;
+reg [3:0] rx_input_microphase_ctr;
+reg [3:0] rx_output_microphase_ctr;
+
+assign tx_input_microphase_addr_limit = (tx_input_microphase_ctr==MICROPHASE_LIMIT_INPUTS-1)?MICROPHASE_MOD_INPUTS:10'd1023;
+assign tx_output_microphase_addr_limit = (tx_output_microphase_ctr==MICROPHASE_LIMIT_OUTPUTS-1)?MICROPHASE_MOD_OUTPUTS:10'd1023;
+assign rx_input_microphase_addr_limit = (rx_input_microphase_ctr==MICROPHASE_LIMIT_INPUTS-1)?MICROPHASE_MOD_INPUTS:10'd1023;
+assign rx_output_microphase_addr_limit = (rx_output_microphase_ctr==MICROPHASE_LIMIT_OUTPUTS-1)?MICROPHASE_MOD_OUTPUTS:10'd1023;
+
+
+wire [5:0] TX_INPUT_ADDR_LIMIT;    // # of inputs used (considering 8 inputs per address)
+wire [3:0] TX_INPUT_ADDR_MOD;      // max burst length of 16
+wire [5:0] TX_OUTPUT_ADDR_LIMIT;   // # of outputs used (considering 8 outputs per address)
+wire [3:0] TX_OUTPUT_ADDR_MOD;     // max burst length of 16
+
+wire [9:0] RX_INPUT_ADDR_LIMIT;    // # of inputs used (considering 8 inputs per address)
+wire [3:0] RX_INPUT_ADDR_MOD;      // max burst length of 16
+wire [9:0] RX_OUTPUT_ADDR_LIMIT;   // # of outputs used (considering 8 outputs per address)
+wire [3:0] RX_OUTPUT_ADDR_MOD;     // max burst length of 16
+
+// Phase control and BRAM/URAM select during Phase 1
+reg tx_phase, tx_phase_inc, tx_select, tx_select_inc;
+reg tx_done_rst, tx_phase1_done, tx_phase2_done;
+reg rx_done_rst, rx_phase1_done, rx_phase2_done;
+reg [22:0] tx_ptr_ctr, rx_ptr_ctr;
+reg tx_ptr_ctr_rst, rx_ptr_ctr_rst;
+
+//reg [9:0] tx_addr;
+reg [5:0] tx_addr; //Previously [9:0], now [5:0] as we are doing in 16 microphases.
+reg tx_addr_rst, tx_addr_inc;
+reg [9:0] rx_addr;   //Previously [13:0], now [9:0] as we are doing in 16 microphases
+reg rx_addr_rst, rx_addr_inc;
+
+reg  [22:0] ptr_addr;
+reg   [8:0] ptr_len, ptr_ctr;
+wire  [3:0] ptr_burst;
+reg ptr_addr_set, ptr_addr_inc;
+
+
+
+// Send commands FSM declaration at the top
+reg [3:0] tx_curr_state, tx_next_state;
+localparam [3:0] TX_STATE_RESET                          = 4'd0;
+localparam [3:0] TX_STATE_IDLE                           = 4'd1;
+localparam [3:0] TX_STATE_SEND_INPUT_READ_COMMANDS       = 4'd2;
+localparam [3:0] TX_STATE_SEND_OUTPUT_READ_COMMANDS      = 4'd3;
+localparam [3:0] TX_STATE_PHASE1_DONE                    = 4'd4;
+localparam [3:0] TX_STATE_POP_POINTER_FIFO               = 4'd5;
+localparam [3:0] TX_STATE_SEND_POINTER_READ_COMMANDS     = 4'd6;
+localparam [3:0] TX_STATE_PHASE2_DONE_WAIT               = 4'd7;
+localparam [3:0] TX_STATE_PHASE2_DONE                    = 4'd8;
+localparam [3:0] TX_STATE_READ_HBM_ADDR                  = 4'd9;
+localparam [3:0] TX_STATE_WRITE_HBM_ADDR                 = 4'd10;
+localparam [3:0] TX_STATE_WRITE_HBM_DATA                 = 4'd11;
+localparam [3:0] TX_STATE_WRITE_HBM_RESP                 = 4'd12;
+
+assign hbm_curr_state = tx_curr_state;
+
+always @(posedge clk) begin
+    if (~resetn) tx_curr_state <= TX_STATE_RESET;
+    else         tx_curr_state <= tx_next_state;
+end
+
+
+// Receive commands FSM declaration at the top
+reg [3:0] rx_curr_state, rx_next_state;
+localparam [3:0] RX_STATE_RESET                = 4'd0;
+localparam [3:0] RX_STATE_IDLE                 = 4'd1;
+localparam [3:0] RX_STATE_WAIT_BRAM_PIPELINE   = 4'd2;
+localparam [3:0] RX_STATE_READ_INPUT_POINTERS  = 4'd3;
+localparam [3:0] RX_STATE_WAIT_URAM_PIPELINE   = 4'd4;
+localparam [3:0] RX_STATE_READ_OUTPUT_POINTERS = 4'd5;
+localparam [3:0] RX_STATE_PHASE1_DONE          = 4'd6;
+localparam [3:0] RX_STATE_READ_SYNAPSE_DATA    = 4'd7;
+localparam [3:0] RX_STATE_PHASE2_DONE          = 4'd8;
+localparam [3:0] RX_STATE_PHASE2_DONE_WAIT     = 4'd9;
+localparam [3:0] RX_STATE_READ_HBM_RESP        = 4'd10;
+
+always @(posedge clk) begin
+    if (~resetn) rx_curr_state <= RX_STATE_RESET;
+    else         rx_curr_state <= rx_next_state;
+end
+
+
+/////////////////
+// ASSIGNMENTS //
+/////////////////
+
+//16 Neuron Group Address Limits
+//We need to traverse in multiple of 2 cycles, as we expect exec_hbm_rvalidready after 2 cycles to pass it on to IEP/EEP/PFC.
+//If there are odd number of cycles from HBM, IEP and EEP will hang waiting for exec_hbm_rvalidready
+
+/*
+assign INPUT_ADDR_LIMIT  = num_inputs[16:7];     // 8 inputs per address x max burst length of 16
+assign INPUT_ADDR_MOD    = (num_inputs[3]==0)?num_inputs[6:3]+1:num_inputs[6:3];
+assign OUTPUT_ADDR_LIMIT = num_outputs[16:7];   // 8 outputs per address
+assign OUTPUT_ADDR_MOD   = (num_outputs[3]==0)?num_outputs[6:3]+1:num_outputs[6:3];
+*/
+
+assign TX_INPUT_ADDR_LIMIT  = tx_input_microphase_addr_limit[9:4];     // 8 inputs per address x max burst length of 16
+assign TX_INPUT_ADDR_MOD    = (tx_input_microphase_addr_limit[0]==0)?tx_input_microphase_addr_limit[3:0]+1:tx_input_microphase_addr_limit[3:0];
+assign TX_OUTPUT_ADDR_LIMIT = tx_output_microphase_addr_limit[9:4];   // 8 outputs per address
+assign TX_OUTPUT_ADDR_MOD   = (tx_output_microphase_addr_limit[0]==0)?tx_output_microphase_addr_limit[3:0]+1:tx_output_microphase_addr_limit[3:0];
+
+assign RX_INPUT_ADDR_LIMIT  = rx_input_microphase_addr_limit[9:4];     // 8 inputs per address x max burst length of 16
+assign RX_INPUT_ADDR_MOD    = (rx_input_microphase_addr_limit[0]==0)?rx_input_microphase_addr_limit[3:0]+1:rx_input_microphase_addr_limit[3:0];
+assign RX_OUTPUT_ADDR_LIMIT = rx_output_microphase_addr_limit[9:4];   // 8 outputs per address
+assign RX_OUTPUT_ADDR_MOD   = (rx_output_microphase_addr_limit[0]==0)?rx_output_microphase_addr_limit[3:0]+1:rx_output_microphase_addr_limit[3:0];
+
+// Drive mandatory signals
+assign hbm_arid    = 6'd0;
+assign hbm_arburst = 2'b01; // burst type = incrementing
+assign hbm_arsize  = 3'd5;  // data bus width: 8 x 2^arsize = 8x32 = 256 bits
+
+assign hbm_awid    = 6'd0;
+assign hbm_awburst = 2'b01; // burst type = incrementing
+assign hbm_awsize  = 3'd5;  // data bus width: 8 x 2^arsize = 8x32 = 256 bits
+assign hbm_awaddr  = {5'd0, ci2hbm_dout[278:256], 5'd0};
+assign hbm_awlen   = 4'd0;
+
+//assign hbm_wvalid  = 1'b0;
+assign hbm_wdata   = ci2hbm_dout[255:0];
+assign hbm_wlast   = 1'b1;
+assign hbm_wstrb   = {{HBM_BYTE_COUNT}{1'b1}};
+
+
+//////////////
+// BEHAVIOR //
+//////////////
+
+
+
+always @(posedge clk) begin
+    // Phase 1 (tx_phase=0) vs. Phase 2 (tx_phase=1)
+    if (~resetn)
+        tx_phase <= 1'b0;
+    else if (tx_phase_inc)
+        tx_phase <= ~tx_phase;
+
+    // BRAM (tx_select=0) vs. URAM (tx_select=1)
+    if (~resetn)
+        tx_select <= 1'b0;
+    else if (tx_select_inc)
+        tx_select <= ~tx_select;
+
+    // HBM address during Phase 1 (i.e. for BRAM and URAM)
+    if (~resetn | tx_addr_rst)
+        tx_addr <= 6'd0;
+    else if (tx_addr_inc)
+        tx_addr <= tx_addr + 1'b1;
+        
+    if (~resetn) begin
+        tx_phase1_done <= 1'b1;
+        tx_phase2_done <= 1'b1;
+        tx_input_microphase_ctr <= 4'b0;
+        tx_output_microphase_ctr <= 4'b0;
+    end else if (tx_done_rst) begin
+        tx_phase1_done <= 1'b0;
+        tx_phase2_done <= 1'b0;
+    end else if (tx_curr_state == TX_STATE_IDLE) begin
+        tx_input_microphase_ctr <= 4'b0;
+        tx_output_microphase_ctr <= 4'b0;
+        tx_phase1_done <= 1'b0;
+        tx_phase2_done <= 1'b0;
+    end else if (tx_curr_state == TX_STATE_SEND_INPUT_READ_COMMANDS || tx_curr_state == TX_STATE_SEND_OUTPUT_READ_COMMANDS) begin
+        tx_phase1_done <= 1'b0;
+        tx_phase2_done <= 1'b0;
+    end else if (tx_curr_state==TX_STATE_PHASE1_DONE) begin
+        tx_phase1_done <= 1'b1;
+    end else if (tx_curr_state==TX_STATE_PHASE2_DONE_WAIT) begin
+        tx_phase2_done <= 1'b1;
+    end else if (tx_curr_state==TX_STATE_PHASE2_DONE) begin
+        tx_phase2_done <= 1'b1;  
+        if (tx_input_microphase_ctr != MICROPHASE_LIMIT_INPUTS)     tx_input_microphase_ctr <= tx_input_microphase_ctr + 1'b1;
+        if (tx_output_microphase_ctr != MICROPHASE_LIMIT_OUTPUTS)   tx_output_microphase_ctr <= tx_output_microphase_ctr + 1'b1;
+    end
+end
+
+assign exec_hbm_tx_phase1_done = tx_phase1_done;
+assign exec_hbm_tx_phase2_done = tx_phase2_done;
+
+assign ptr_burst = (ptr_ctr[8:4]==ptr_len[8:4]) ? ptr_len[3:0] : 4'hf;
+
+always @(posedge clk) begin
+    if (~resetn) begin
+        ptr_addr <= 23'd0;
+        ptr_len  <= 9'd0;
+        ptr_ctr  <= 9'd0;
+    end else if (ptr_addr_inc) begin
+        ptr_addr <= ptr_addr + ptr_burst + 1'b1;
+        ptr_ctr  <= ptr_ctr + ptr_burst + 1'b1;
+    end else if (ptr_addr_set) begin
+        ptr_addr       <= ptrFIFO_dout[22:0];
+        ptr_len        <= ptrFIFO_dout[31:23];
+        ptr_ctr        <= 9'd0;
+    end
+end
+
+always @(posedge clk) begin
+    if (~resetn | tx_ptr_ctr_rst)
+        tx_ptr_ctr <= 23'd0;
+    else if (ptr_addr_inc)
+        tx_ptr_ctr <= tx_ptr_ctr + ptr_burst + 1'b1;
+end
+
+// for read from/write to HBM, use tx_done
+always @(*) begin
+    if (tx_phase1_done & tx_phase2_done) begin
+        hbm_araddr <= {5'd0, ci2hbm_dout[278:256], 5'd0};
+    end else begin
+        if (~tx_phase) begin
+            hbm_araddr <= (tx_select)?{5'd0, {8'd0, tx_select, tx_output_microphase_ctr, tx_addr, 4'd0}, 5'd0}:{5'd0, {8'd0, tx_select, tx_input_microphase_ctr, tx_addr, 4'd0}, 5'd0};
+        end else begin
+            hbm_araddr <= {5'd0, ptr_addr, 5'd0};
+        end
+    end
+end
+
+always @(*) begin
+    if (tx_phase1_done & tx_phase2_done) begin
+        hbm_arlen <= 4'd0;
+    end else begin
+        if (~tx_phase) begin
+            if (~tx_select) begin
+                if (tx_addr==TX_INPUT_ADDR_LIMIT)
+                    hbm_arlen <= TX_INPUT_ADDR_MOD;
+                else
+                    hbm_arlen <= 4'hF;
+            end else begin
+                if (tx_addr==TX_OUTPUT_ADDR_LIMIT)
+                    hbm_arlen <= TX_OUTPUT_ADDR_MOD;
+                else
+                    hbm_arlen <= 4'hF;
+            end
+        end else
+            hbm_arlen <= ptr_burst;
+    end
+end
+
+// Wait to ensure that ptrFIFO has been completely emptied during Phase 2
+//  Since simple round-robin is used, up to 8 clock cycles may occur before an intermediate pointer FIFO
+//   sends a pointer to ptrFIFO. As a guarantee, we are using 15 clock cycles of no activity to ensure
+//   all pointers have been transmitted.
+reg  [7:0] wait_clks_cnt;
+wire [7:0] wait_clks_limit = 8'd255;
+reg  [4:0] wait_clks_done_cnt;
+wire [4:0] wait_clks_done_limit = 5'd31;
+
+always @(posedge clk) begin
+   if ((tx_curr_state==TX_STATE_POP_POINTER_FIFO) & rx_phase1_done & ptrFIFO_empty)
+      wait_clks_cnt <= wait_clks_cnt + 1'b1;
+   else
+      wait_clks_cnt <= 8'd0;
+   //Wait cycles for rx_phase2_done so that IEP can finish its execution
+   if (rx_curr_state==RX_STATE_PHASE2_DONE_WAIT) wait_clks_done_cnt <= wait_clks_done_cnt + 1'b1;
+   else if ((rx_curr_state == RX_STATE_IDLE) | (rx_curr_state==RX_STATE_PHASE2_DONE)) wait_clks_done_cnt <= 5'd0;
+end
+
+// State machine
+always @(*) begin
+    
+    hbm_arvalid  <= 1'b0;
+    tx_done_rst  <= 1'b0;
+    tx_phase_inc <= 1'b0;
+    
+    // Phase 1: BRAM and URAM addresses
+    tx_addr_rst   <= 1'b0;
+    tx_addr_inc   <= 1'b0;
+    tx_select_inc <= 1'b0;
+    
+    // Phase 2: Pointer address
+    tx_ptr_ctr_rst <= 1'b0;
+    ptr_addr_set   <= 1'b0;
+    ptr_addr_inc   <= 1'b0;
+    ptrFIFO_rden   <= 1'b0;
+
+    // Command Interpreter 'write to HBM' command    
+    hbm_awvalid <= 1'b0;
+    hbm_wvalid  <= 1'b0;
+    hbm_bready  <= 1'b0;
+    ci2hbm_rden <= 1'b0;
+    
+    tx_next_state <= tx_curr_state;
+    
+    case (tx_curr_state)
+        TX_STATE_RESET: begin
+            tx_next_state <= TX_STATE_IDLE;
+        end
+        TX_STATE_IDLE: begin
+            tx_addr_rst <= 1'b1;
+            if (exec_run) begin
+                tx_done_rst <= 1'b1;
+                tx_next_state <= TX_STATE_SEND_INPUT_READ_COMMANDS;
+            end else if (~ci2hbm_empty) begin
+                if (ci2hbm_dout[279]==1'b0)
+                    tx_next_state <= TX_STATE_READ_HBM_ADDR;
+                else
+                    tx_next_state <= TX_STATE_WRITE_HBM_ADDR;
+            end
+        end
+        
+        // Command Interpreter 'read from HBM' command
+        TX_STATE_READ_HBM_ADDR: begin
+            hbm_arvalid <= 1'b1;
+            if (hbm_arready) begin
+                ci2hbm_rden <= 1'b1;
+                tx_next_state <= TX_STATE_IDLE;
+            end
+        end
+        // Command Interpreter 'write to HBM' command
+        TX_STATE_WRITE_HBM_ADDR: begin
+            hbm_awvalid <= 1'b1;
+            if (hbm_awready)
+                tx_next_state <= TX_STATE_WRITE_HBM_DATA;
+        end
+        TX_STATE_WRITE_HBM_DATA: begin
+            hbm_wvalid <= 1'b1;
+            if (hbm_wready)
+                tx_next_state <= TX_STATE_WRITE_HBM_RESP;
+        end
+        TX_STATE_WRITE_HBM_RESP: begin
+            hbm_bready <= 1'b1;
+            if (hbm_bvalid) begin
+                ci2hbm_rden <= 1'b1;
+                tx_next_state <= TX_STATE_IDLE;
+            end
+        end
+        
+        // Phase 1a: Send HBM read commands for external inputs
+        TX_STATE_SEND_INPUT_READ_COMMANDS: begin
+            if (!tx_phase1_done & !tx_phase2_done) begin  //Wait until tx_phase1_done and tx_phase2_done to go low before sending read commands
+                hbm_arvalid <= 1'b1;
+                if (hbm_arready) begin
+                    tx_addr_inc <= 1'b1;
+                    if (tx_addr == TX_INPUT_ADDR_LIMIT) begin
+                        tx_addr_rst   <= 1'b1; 
+                        tx_select_inc <= 1'b1;
+                        if (tx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS) tx_next_state <= TX_STATE_PHASE1_DONE; //Go to SEND_OUTPUT state only if IEP needs this microphase.
+                        else tx_next_state <= TX_STATE_SEND_OUTPUT_READ_COMMANDS;
+                    end
+                end
+            end
+        end
+        // Phase 1b: Send HBM read commands for internal neurons
+        TX_STATE_SEND_OUTPUT_READ_COMMANDS: begin
+            if (!tx_phase1_done & !tx_phase2_done) begin  //Wait until tx_phase1_done and tx_phase2_done to go low before sending read commands
+                hbm_arvalid <= 1'b1;
+                if (hbm_arready) begin
+                    tx_addr_inc <= 1'b1;
+                    if (tx_addr == TX_OUTPUT_ADDR_LIMIT)
+                        tx_next_state <= TX_STATE_PHASE1_DONE;
+                end
+            end
+        end
+        TX_STATE_PHASE1_DONE: begin
+            tx_addr_rst    <= 1'b1; 
+            tx_select_inc  <= 1'b1;
+            tx_phase_inc   <= 1'b1;
+            tx_ptr_ctr_rst <= 1'b1;
+            tx_next_state <= TX_STATE_POP_POINTER_FIFO;        
+        end
+        
+        // Phase 2: Send HBM read commands for pointers
+        TX_STATE_POP_POINTER_FIFO: begin
+            //if (ptrFIFO_empty & rx_phase1_done)     //<- changed here to see if output spike is being missed because of pointer not being loaded in correct time step
+            if (wait_clks_cnt==wait_clks_limit) begin
+               tx_next_state <= TX_STATE_PHASE2_DONE_WAIT;
+            end else if (~ptrFIFO_empty && rx_phase1_done) begin //To add some delay between Phase 1 end and Phase 2 Start in IEP, so that phase 2 not skipped for IEP
+                ptr_addr_set <= 1'b1;
+                ptrFIFO_rden <= 1'b1;
+                tx_next_state <= TX_STATE_SEND_POINTER_READ_COMMANDS;
+            end
+        end
+        TX_STATE_SEND_POINTER_READ_COMMANDS: begin
+            hbm_arvalid <= 1'b1;
+            if (hbm_arready) begin
+                ptr_addr_inc <= 1'b1;
+                if (ptr_ctr[8:4]==ptr_len[8:4])
+                    tx_next_state <= TX_STATE_POP_POINTER_FIFO;
+            end
+        end
+        TX_STATE_PHASE2_DONE_WAIT: begin  //Wait in this state until rx_phase2 is done.
+            if(rx_phase2_done) tx_next_state <= TX_STATE_PHASE2_DONE;
+        end
+        TX_STATE_PHASE2_DONE: begin
+            tx_phase_inc  <= 1'b1;
+             if ((tx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS || tx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS-1) && (tx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS || tx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS-1)) tx_next_state <= TX_STATE_IDLE; 
+             else if ((tx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS || tx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS-1)) begin
+                            tx_next_state <= TX_STATE_SEND_OUTPUT_READ_COMMANDS;  
+                            tx_select_inc <= 1'b1;
+             end else tx_next_state <= TX_STATE_SEND_INPUT_READ_COMMANDS;  
+        end
+        
+        default: begin
+            tx_next_state <= TX_STATE_RESET;
+        end
+    endcase
+end
+
+// Receive data
+//assign exec_hbm_rvalidready = hbm_rvalid & hbm_rready;
+reg hbm_count; //Denoting the even number of hbm packet receive, For first 256b packet, count=1, Second 256b packet, count=0, then reset.
+//Send data to hbm2iep unless it's full.
+assign exec_hbm_rvalidready = hbm_rvalid & hbm_rready & hbm_count & ~hbmFIFO_full; //hbmFIFO_full has some timing issues. AT Speed of IEP, EEP, PFC
+
+assign exec_hbm_rvalidready_2x = hbm_rvalid & hbm_rready;
+//assign exec_hbm_rvalidready = hbm_rvalid & hbm_rready & ~hbm_count;
+
+always @(posedge clk) begin
+    if (~resetn | rx_addr_rst)
+        rx_addr <= 10'd0;
+    else if (rx_addr_inc)
+        rx_addr <= rx_addr + 1'b1;
+        
+    if (~resetn) begin
+        rx_phase1_done <= 1'b1;
+        rx_phase2_done <= 1'b1;
+        rx_input_microphase_ctr <= 4'b0;
+        rx_output_microphase_ctr <= 4'b0;
+    end else if (rx_done_rst) begin
+        rx_phase1_done <= 1'b0;
+        rx_phase2_done <= 1'b0;
+    end else if (rx_curr_state == RX_STATE_IDLE) begin
+        rx_input_microphase_ctr <= 4'b0;
+        rx_output_microphase_ctr <= 4'b0;
+        rx_phase1_done <= 1'b0;
+        rx_phase2_done <= 1'b0;
+    end else if (rx_curr_state == RX_STATE_WAIT_BRAM_PIPELINE || rx_curr_state == RX_STATE_WAIT_URAM_PIPELINE ) begin
+        rx_phase1_done <= 1'b0;
+        rx_phase2_done <= 1'b0;
+    end else if (rx_curr_state == RX_STATE_PHASE1_DONE)
+        rx_phase1_done <= 1'b1;
+    else if (rx_curr_state == RX_STATE_PHASE2_DONE) begin
+        rx_phase2_done <= 1'b1;
+        if (rx_input_microphase_ctr != MICROPHASE_LIMIT_INPUTS) rx_input_microphase_ctr <= rx_input_microphase_ctr + 1'b1;
+        if (rx_output_microphase_ctr != MICROPHASE_LIMIT_OUTPUTS) rx_output_microphase_ctr <= rx_output_microphase_ctr + 1'b1;
+     //If we assign rx_phase2_done during the WAIt state, IEP might miss some packets. The delay is basically for Clock domain synchronization FIFO. 
+     //Alternatively, We could have used uram_phase2_done from IEP to exit the HBM RX_PHASE2_DONE state. 
+    end else if (rx_curr_state == RX_STATE_PHASE2_DONE_WAIT && wait_clks_done_cnt == wait_clks_done_limit-2) begin
+        //Assign rx_phase2_done sometime before RX_PHASE2_DONE, otherwise IEP misses it.
+        rx_phase2_done <= 1'b1;
+    end
+end
+
+
+always @(*) begin
+    
+    hbm_rready  <= 1'b0;
+    rx_done_rst <= 1'b0;
+    
+    // Phase 1: BRAM and URAM addresses
+    rx_addr_rst <= 1'b0;
+    rx_addr_inc <= 1'b0;
+    
+    // Phase 2: pointer counter
+    rx_ptr_ctr_rst <= 1'b0;
+    
+    // Command Interpreter
+    hbm2ci_wren <= 1'b0;
+    
+    rx_next_state <= rx_curr_state;
+    
+    case (rx_curr_state)
+        RX_STATE_RESET: begin
+            rx_next_state <= RX_STATE_IDLE;
+        end
+        RX_STATE_IDLE: begin
+            if (exec_run) begin
+                rx_done_rst <= 1'b1;
+                rx_next_state <= RX_STATE_WAIT_BRAM_PIPELINE;
+            end else if (tx_next_state==TX_STATE_READ_HBM_ADDR)
+                rx_next_state <= RX_STATE_READ_HBM_RESP;
+        end
+        
+        // Read response to Command Interpreter 'read from HBM' command
+        RX_STATE_READ_HBM_RESP: begin
+            if (hbm_rvalid & ~hbm2ci_full) begin
+                hbm_rready <= 1'b1;
+                hbm2ci_wren <= 1'b1;
+                rx_next_state <= RX_STATE_IDLE;
+            end
+        end
+        
+        // Read external input pointers in parallel with BRAM read
+        RX_STATE_WAIT_BRAM_PIPELINE: begin
+            rx_addr_rst <= 1'b1;
+            if (exec_bram_phase1_ready)
+                rx_next_state <= RX_STATE_READ_INPUT_POINTERS;
+        end
+        RX_STATE_READ_INPUT_POINTERS: begin
+            hbm_rready <= 1'b1;
+            //This is giving issue if we don't get multiple rvalid in consecutive cycle, then rx_addr updates and we are changing state without waiting for remaining HBM packets.
+            //For the 2nd else condition, we want rx_addr={RX_INPUT_ADDR_LIMIT,RX_INPUT_ADDR_MOD}+1 to determine if we are done.
+            if (hbm_rvalid & ~hbmFIFO_full) begin 
+                rx_addr_inc <= 1'b1;
+                if (rx_addr == {RX_INPUT_ADDR_LIMIT,RX_INPUT_ADDR_MOD})
+                    if (rx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS) rx_next_state <= RX_STATE_PHASE1_DONE;
+                    else rx_next_state <= RX_STATE_WAIT_URAM_PIPELINE;
+            end else if ((rx_addr-1 == {RX_INPUT_ADDR_LIMIT,RX_INPUT_ADDR_MOD})) begin
+                   if (rx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS) rx_next_state <= RX_STATE_PHASE1_DONE;
+                   else rx_next_state <= RX_STATE_WAIT_URAM_PIPELINE;
+            end
+        end
+        // Read internal neuron pointers in parallel with URAM read
+        RX_STATE_WAIT_URAM_PIPELINE: begin
+            rx_addr_rst <= 1'b1;
+            if (exec_uram_phase1_ready)
+                rx_next_state <= RX_STATE_READ_OUTPUT_POINTERS;
+        end
+        RX_STATE_READ_OUTPUT_POINTERS: begin
+            hbm_rready <= 1'b1;
+            //Same changes as RX_STATE_READ_INPUT_POINTERS
+            if (hbm_rvalid & ~hbmFIFO_full) begin //Don't increment the address if the HBM FIFO to IEP and PFC full. But this is causing some timing issues.
+            //if (hbm_rvalid) begin
+                rx_addr_inc <= 1'b1;
+                if (rx_addr == {RX_OUTPUT_ADDR_LIMIT,RX_OUTPUT_ADDR_MOD})
+                    rx_next_state <= RX_STATE_PHASE1_DONE;
+            end else if (rx_addr-1 == {RX_OUTPUT_ADDR_LIMIT,RX_OUTPUT_ADDR_MOD}) rx_next_state <= RX_STATE_PHASE1_DONE;
+        end
+        RX_STATE_PHASE1_DONE: begin
+            rx_ptr_ctr_rst <= 1'b1;
+            rx_next_state <= RX_STATE_READ_SYNAPSE_DATA;
+        end
+        
+        // Pop pointer FIFO and read HBM synapse data during phase 2
+        RX_STATE_READ_SYNAPSE_DATA: begin
+            hbm_rready <= 1'b1;
+            if (tx_phase2_done & (rx_ptr_ctr==tx_ptr_ctr))
+                rx_next_state <= RX_STATE_PHASE2_DONE_WAIT;
+        end
+        RX_STATE_PHASE2_DONE_WAIT: begin  //WAIT PHASE is added so that IEP has enough time to finish phase 2
+                if (wait_clks_done_cnt == wait_clks_done_limit) rx_next_state <= RX_STATE_PHASE2_DONE;
+        end
+        RX_STATE_PHASE2_DONE: begin
+            //if (rx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS && rx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS) rx_next_state <= RX_STATE_IDLE;
+            //else rx_next_state <= RX_STATE_WAIT_BRAM_PIPELINE;
+            if ((rx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS || rx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS-1) && (rx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS || rx_output_microphase_ctr == MICROPHASE_LIMIT_OUTPUTS-1)) rx_next_state <= RX_STATE_IDLE; 
+            else if ((rx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS || rx_input_microphase_ctr == MICROPHASE_LIMIT_INPUTS-1)) rx_next_state <= RX_STATE_WAIT_URAM_PIPELINE;
+            else rx_next_state <= RX_STATE_WAIT_BRAM_PIPELINE;
+        end
+        
+        default: begin
+            rx_next_state <= RX_STATE_RESET;
+        end
+    endcase
+end
+
+always @(posedge clk) begin
+    if (~resetn | rx_ptr_ctr_rst)
+        rx_ptr_ctr <= 23'd0;
+    else if ((rx_curr_state==RX_STATE_READ_SYNAPSE_DATA) & exec_hbm_rvalidready_2x) //exec_hbm_rvalidready previously (caused Hang at RX_STATE_READ_SYNAPSE_DATA)
+        rx_ptr_ctr <= rx_ptr_ctr + 1'b1;
+end
+
+assign exec_hbm_rx_phase1_done = rx_phase1_done;
+assign exec_hbm_rx_phase2_done = rx_phase2_done;
+
+assign hbm2ci_din = hbm_rdata;
+//assign exec_hbm_rdata = hbm_rdata;
+reg [255:0] hbm_rdata_upper;
+reg [255:0] hbm_rdata_lower;
+
+//assign exec_hbm_rdata = {hbm_rdata_upper, hbm_rdata_lower};
+assign exec_hbm_rdata = {hbm_rdata, hbm_rdata_lower};//Because hbm_rdata_lower and hbm_rdata_upper are one cycle delayed.
+//Latch hbm_rdata at 1st rvalid and hold it until 2nd rvalid
+always @(posedge clk) begin
+    if (~resetn) begin
+        hbm_rdata_lower <=256'b0;
+        hbm_rdata_upper <=256'b0;
+        hbm_count <= 1'b0;
+    end
+    else if (hbm_rvalid && hbm_rready) begin
+        hbm_count <= ~hbm_count;
+        if(~hbm_count) hbm_rdata_lower <= hbm_rdata;
+        else hbm_rdata_upper <= hbm_rdata;
+    end
+end
+//// for debugging
+//assign vio_rvalid = hbm_rvalid;
+//assign vio_arready = hbm_arready;
+//assign vio_tx_state = tx_curr_state;
+//assign vio_rx_state = rx_curr_state;
+
+//assign vio_ptr_addr = ptr_addr;
+//assign vio_ptr_len = ptr_len; 
+//assign vio_ptr_ctr = ptr_ctr;
+//assign vio_ptr_burst = ptr_burst;
+
+//assign vio_rx_ptr_ctr = rx_ptr_ctr;
+//assign vio_tx_ptr_ctr = tx_ptr_ctr;
+
+endmodule
