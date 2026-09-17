@@ -1,0 +1,9 @@
+
+
+
+set_property CLOCK_DEDICATED_ROUTE ANY_CMT_COLUMN [get_nets clock_and_buffer_i/util_ds_buf_0/U0/IBUF_OUT[0]]
+
+
+
+
+

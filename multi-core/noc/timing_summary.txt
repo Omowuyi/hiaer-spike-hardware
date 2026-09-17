@@ -1,0 +1,12 @@
+WNS = 0.007763
+Build date: Wed Jun 24 04:38:47 PDT 2026
+Clock: aclk = 125 MHz, aclk450 = 250 MHz, apb_clk = 100 MHz
+
+Fixes included:
+1. NoC integration (routers, injectors, L1/L2 crossbars, 16x CDC FIFOs)
+2. INTER_CORE synapse routing (HBM processor opcode 001)
+3. HBM processor pipeline register (exec_hbm_rdata + exec_hbm_rvalidready)
+4. HBM APB false_path constraint (apb_clk <-> aclk)
+5. IEP multi-driven net fix (delay_add defaults moved to correct always block)
+6. IEP delay match pipeline (dm_match_pipe, dm_is_upper_pipe)
+7. Routing table CMD 0x0D
