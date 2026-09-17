@@ -16,10 +16,14 @@ See [`docs/FIREFLY.md`](docs/FIREFLY.md) for the full design.
 so a remote route reuses it with the mask becoming an Aurora port bitmask — four
 bits, four ports per FPGA. One decode arm, no wider table, no packet change.
 
-**This premise needs rechecking.** The router in
-[`../noc/`](../noc/) decodes `OP_NOP` and silently drops the spike. The
-simulation that found NOP unused ran against an earlier router. Verify against
-the router in `../noc_exp_psc/rtl/` before building on this.
+**Verified against the router this will run on.** In
+`../noc_exp_psc/rtl/noc_spike_router.sv` the routing FSM tests only `OP_LOCAL`,
+`OP_L1` and `OP_L2`; `OP_NOP` falls to the default and takes the host path. The
+value carries no behaviour of its own, so adding a `REMOTE` arm removes nothing.
+
+Note that this is **not** true of the router in [`../noc/`](../noc/), which
+decodes `OP_NOP` explicitly and silently drops the spike. The two designs differ
+here as they do in address width and entry format.
 
 **A remote destination table per FPGA, not per core** — 256 × 6 bits giving
 `{server, fpga}`, written by CMD 16. The destination depends on the neuron block,
