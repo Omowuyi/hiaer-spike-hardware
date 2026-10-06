@@ -7,8 +7,14 @@ widened from 17 to 19 bits and the Firefly optical subsystem added.
 |---|---|
 | **Built on** | crisdsc3, `/data/omowuyi/multicore_noc_exp_psc/` |
 | **Tested on** | crisdsc0 |
-| **WNS** | +0.037 ns |
-| **Status** | **unverified** — built, never flashed |
+| **WNS** | **+0.002 ns**, zero failing endpoints (NoC-only build, 3 Oct 2026) |
+| **Status** | **BLOCKED** — flashed; PCIe enumerates, DMA hangs |
+
+Every bitstream from this project fails DMA. Bitstreams from
+`single_core_exp_psc` and `multicore_noc` work. Those two have their XDMA IP
+synthesised OUT_OF_CONTEXT; this one is GLOBAL. The mechanism is not
+identified — see `MANIFEST.md` for the full correlation and what has been
+ruled out.
 
 ---
 
@@ -60,9 +66,30 @@ one core and were not widened.
 
 ---
 
-## Not verified
+## What has and has not run on hardware
 
-Nothing in this design has run on hardware. Specifically unverified: the merged
-bitstream, routing tables on a device, any Aurora link, per-synapse delay, STDP.
+**Verified.** The host software path, against L6m: 42/42 regression after every
+patch. That covers per-core indexing, partitioning, per-core compilation and
+readback, and the coreID `tdest` fix.
 
-The microphase boundary defect is inherited from the biological core.
+**Flashed and failing.** The NoC-only bitstream enumerates on PCIe and hangs on
+the first DMA transfer. `sixteen_core_firefly_v3.bit` does the same, and
+predates all of this work.
+
+**Never run.** Routing tables on a device, any inter-core spike, any Aurora
+link, per-synapse delay, STDP. None of these can be tested until DMA works.
+
+The microphase boundary defect is inherited from the biological core, and is
+now per core rather than per network.
+
+---
+
+## Reproducing the software
+
+`software/src_v3_multicore/` holds the exact host sources as a snapshot, with
+`PROVENANCE.txt` recording the repo, branch and commit each came from. The lab
+repos remain authoritative; this copy exists so the repo is self-contained.
+
+`software/patch_*.py` and `software/fix_*.py` reproduce those sources from clean
+checkouts. Each matches one anchor, aborts otherwise, and writes a backup. The
+order is in `MANIFEST.md`.
