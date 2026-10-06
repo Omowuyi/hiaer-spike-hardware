@@ -1,0 +1,9 @@
+connectome_utils   v3_multicore 4a99d8d3e1be535da7799fff744cb39e4971b7cd
+hs_bridge          v3_19bit_wip 153a3aa9dd9a68dfd70951cc26017b4d191eb0fc
+hs_api             exp-STDP-testing-suite 6b26fb464f1fe16b28cbad244748d7d53e928af9
+2937c940c6db7edc36d965661c549213  /tmp/vendor/api.py
+7c31ed0036d8a5e26cecb44eb61416cb  /tmp/vendor/compile_network.py
+7d18798ed925f8522e6b7ccf0cd45a10  /tmp/vendor/connectome.py
+b578a470cf0c5405a10eda536bbfee69  /tmp/vendor/fpga_controller.py
+04ff1b6240f87a27e9c71034221f70d1  /tmp/vendor/network.py
+ef3d3861db6be9184d213f5b675e76a8  /tmp/vendor/noc_routing.py

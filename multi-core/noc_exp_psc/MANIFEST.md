@@ -143,3 +143,168 @@ pairs reachable, worst case 3 hops.
 **Not verified:** the merged bitstream, routing tables on hardware, any Aurora
 link, per-synapse delay, STDP end to end. The microphase boundary still loses
 16 neurons per boundary.
+---
+
+## v3 multicore software + NoC-only bitstream — 29 Sep to 3 Oct 2026
+
+Per-core placement made real end to end, three latent defects fixed, and a
+NoC-only bitstream built that closes timing and **does not pass DMA**. The
+DMA failure is unresolved and is the blocking issue for this design.
+
+### Bitstream
+
+| | |
+|---|---|
+| **File** | `sixteen_core_noc_only_v3.bit` |
+| **Built** | crisdsc3, `/data/omowuyi/multicore_noc_exp_psc/`, 3 Oct 2026 04:07 |
+| **MD5** | `ad5c57080b026e1aeded090bebf1bddb` |
+| **Top** | `sixteen_core_noc_top` (generated; no Firefly, no GT ports) |
+| **WNS / WHS** | **+0.002 ns / 0.000 ns**, zero failing endpoints of 1,468,640 |
+| **Status** | **FAILS** — enumerates on PCIe, first DMA transfer hangs |
+
+### Host software — vendored in `software/src_v3_multicore/`
+
+Snapshots. The lab repos remain authoritative.
+
+| repo | branch | commit |
+|---|---|---|
+| `connectome_utils` | `v3_multicore` | `4a99d8d3e1be535da7799fff744cb39e4971b7cd` |
+| `hs_bridge` | `v3_19bit_wip` | `153a3aa9dd9a68dfd70951cc26017b4d191eb0fc` |
+| `hs_api` | `exp-STDP-testing-suite` | `6b26fb464f1fe16b28cbad244748d7d53e928af9` |
+
+| file | md5 |
+|---|---|
+| `api.py` | `2937c940c6db7edc36d965661c549213` |
+| `compile_network.py` | `7c31ed0036d8a5e26cecb44eb61416cb` |
+| `connectome.py` | `7d18798ed925f8522e6b7ccf0cd45a10` |
+| `fpga_controller.py` | `b578a470cf0c5405a10eda536bbfee69` |
+| `network.py` | `04ff1b6240f87a27e9c71034221f70d1` |
+| `noc_routing.py` | `ef3d3861db6be9184d213f5b675e76a8` |
+
+Verified **42/42** hardware regression on L6m after every patch.
+
+### What the software now does
+
+Multi-core placement did not exist before this work. `compile_network.partition()`
+hardcoded `n_cores = 1`, `map_to_hbm_fpga()` looped over cores without filtering,
+and both `coreTypeIdx` and `hbmIdx` were enumerated globally. Seven changes, in
+dependency order:
+
+1. **Per-core neuron and axon indexing** — `coreTypeIdx` and `hbmIdx` restart at
+   0 on each core; `pad_models` computes model cutoffs per core; lookup is by
+   `(core, idx)`. The lookup also became a dict instead of a linear scan run
+   once per spike, which cut the regression suite from 279 s to 60 s.
+2. **Real partitioning** — the hardcode removed, per-core filtering in
+   `map_to_hbm_fpga`, caller-supplied `membership`.
+3. **Partition applied before `pad_models`** — padding is per `(core, model)` to
+   a multiple of 32, so it was computed with every neuron still on core 0.
+4. **Per-core runtime** — one `fpga_compiler` per core with its own
+   `num_outputs`, cutoffs, inputs and readback; all cores loaded before any is
+   started, so spikes land in the right timestep.
+5. **19-bit spike decode with CORE_ID** — `{ts[31:24], valid[23], core[22:19],
+   neuron[18:0]}`. Core appended as a third tuple element so `spike[1]` stays
+   the address.
+6. **coreID field width** — see below.
+7. **Routing tables loaded during construction**, from the same assignment the
+   partition used.
+
+### Three latent defects found
+
+**`cdc_timing.xdc` was inert in every build ever made.** Every `set_max_delay`
+sat inside an `if`, which XDC rejects (`Designutils 20-1307`). None had ever
+applied. Rewritten without control flow, plus a PCIe↔core bound and
+reset-synchroniser false paths. Took this build from WNS −2.142 ns with 1,558
+failing endpoints to +0.002 ns with none. **This affects the Firefly build
+equally** — it closed timing only because `ff7_pins.xdc`'s blanket clock groups
+happened to cover the same crossings.
+
+**coreID encoded as 8 bits where `tdest` reads 5.** `write_parameters_simple`
+and `write_neuron_type` wrote `np.binary_repr(coreID,8)` at `[503:496]`;
+`switch_1_32.sv:9` takes `tdest` from `tdata[503:499]`. The 8-bit form sent
+`coreID >> 3`, so cores 1–7 all steered to core 0 and cores 8–15 to core 1.
+Harmless at core 0, which is every test ever run. Eight other functions already
+used the correct 5-bit form.
+
+**`noc_routing.py` was keyed on destination blocks.** `noc_spike_router.sv:87`
+is `route_idx = spike_addr_in[18:9]`, and `spike_addr_in` is the core's own
+spike output — so the table is **source**-indexed. Also corrected: opcode 13→15,
+address `[13:6]`→`[15:6]`, 256→1024 entries, and the payload core field removed
+(the core comes from `tdest`).
+
+### THE BLOCKING ISSUE — DMA
+
+Every bitstream from `multicore_noc_exp_psc` fails DMA. Bitstreams from two
+other projects work. **The mechanism is not identified.**
+
+| bitstream | project | XDMA `SYNTHESISFLOW` | result |
+|---|---|---|---|
+| `sixteen_core_top_L6m.bit` | `single_core_exp_psc` | OUT_OF_CONTEXT | works, 42/42 |
+| `sixteen_core_top_multicore_noc_5.bit` | `multicore_noc` | OUT_OF_CONTEXT | works, DMA read OK |
+| `sixteen_core_firefly_v3.bit` | `multicore_noc_exp_psc` | GLOBAL | fails |
+| `sixteen_core_noc_only_v3.bit` ×2 | `multicore_noc_exp_psc` | GLOBAL | fails |
+
+`multicore_noc_5` is a 16-core NoC design, so core count is not the variable.
+
+**Signature:** PCIe enumerates, link trains x16 8.0 GT/s, BAR 0 assigned,
+`/dev/adxdma0*` created — then the first host-to-card transfer hangs in
+`adxdma_h2c_release` → `adxdma_cleanup_dma_requests`, state D. Module refcount
+leaks and only a reboot clears it.
+
+**Do not pursue the `start_stop_dma_engine` warning.** It appears on L6m too,
+which passes 42/42 — counted 12 occurrences on a working load. `dma_core.c:673`
+compares a descriptor address's high word against a descriptor count; it fires
+when DMA memory is allocated above 4 GB. Noise.
+
+**Ruled out:** GT placement (AVAL-324 4→0 under OOC, but the channels were
+placed correctly); the driver warning; copied-checkpoint context mismatch
+(regenerating the IP natively in this project gave the same `Opt 31-67`);
+AXI-ST bypass ports (enabled in a working project too); undriven `tlast`/`tkeep`
+in the ingress bypass (a real bug, fixed, did not resolve it — and
+`firefly_v3` predates that code entirely).
+
+**The OOC blocker:** setting this project's XDMA to out-of-context reaches
+`opt_design`, which fails on one LUT2 in the IP's unused AXI4-MM bridge
+(`Opt 31-67`, `firstdwen_ff_i_2`). `set_msg_config` does not suppress it.
+`single_core_exp_psc` runs `opt_design` on an OOC checkpoint of the same IP
+without hitting this.
+
+**Two options remain:** keep diagnosing this project, or clone
+`single_core_exp_psc` and bring the NoC sources into it. The second starts from
+a configuration that demonstrably produces enumerating bitstreams.
+
+### Reproducing
+
+```bash
+# 1. host software -- apply to clean checkouts, or use software/src_v3_multicore/
+python3 software/patch_percore_connectome.py  <connectome_utils>/connectome_utils/connectome.py
+python3 software/patch_percore_partition.py   <connectome.py> <compile_network.py>
+python3 software/patch_percore_runtime.py     <network.py> <api.py>
+python3 software/fix_flush_merge.py           <network.py>
+python3 software/patch_spike_coreid.py        <fpga_controller.py>
+python3 software/fix_coreid_width.py          <fpga_controller.py>
+python3 software/patch_load_routing.py        <api.py>
+# noc_routing.py must be importable by the test environment
+
+# 2. NoC-only top -- generated, never hand-edited
+python3 patches/make_noc_only_top.py <sixteen_core_noc_firefly_top.sv> <out.sv>
+
+# 3. constraints -- rtl/cdc_timing.xdc replaces the project's inert version
+
+# 4. build: synth_2/impl_2 on constrs_noconly, top sixteen_core_noc_top
+```
+
+Each patch runs `--check` first and aborts unless its anchor matches exactly
+once. Every one was verified by a 42/42 hardware run before the next was
+applied.
+
+### Still open, unrelated to DMA
+
+- **Microphase boundary** — 16 neurons lost at the first row of each microphase
+  after the first. Nine documented fix attempts. Now **per core**, so a 16-core
+  network loses 16 per core, not 16 in total.
+- **Firefly pin constraints** — `ff7_pins.xdc` `PACKAGE_PIN` assignments report
+  `Cannot set LOC property of ports` with an inferred OBUF, in `firefly_v3`'s
+  own `impl_1` log. Predates this work.
+- **`NOC_FIREFLY_DESIGN.md` §4 does not match `hiaer_firefly_pkg.sv`** —
+  `dst_neuron` is 19 bits not 13, there is no `src_server` or `src_neuron`,
+  `timestamp` is 8 bits not 5, and the opcode table differs entirely.
