@@ -225,6 +225,12 @@ and `write_neuron_type` wrote `np.binary_repr(coreID,8)` at `[503:496]`;
 Harmless at core 0, which is every test ever run. Eight other functions already
 used the correct 5-bit form.
 
+**This affects anyone writing host code against a multi-core bitstream.**
+Without the fix, commands for cores 1-7 land on core 0 and cores 8-15 on core
+1, with no error anywhere -- the network runs, and fifteen cores are left
+unprogrammed on reset defaults. The fix is in `hs_bridge` branch
+`v3_19bit_wip` (`153a3aa`), applied by `software/fix_coreid_width.py`.
+
 **`noc_routing.py` was keyed on destination blocks.** `noc_spike_router.sv:87`
 is `route_idx = spike_addr_in[18:9]`, and `spike_addr_in` is the core's own
 spike output — so the table is **source**-indexed. Also corrected: opcode 13→15,
