@@ -1,0 +1,18 @@
+/.idea
+/.ipynb_checkpoints
+/__pycache__
+/Binarized Neural Network/data/processed
+/Binarized Neural Network/__pycache__
+/Binarized Neural Network/data/MNIST
+/Optimization Code/*.m
+/Optimization Code/*.npy
+/Optimization Code/*.dat
+*.txt
+/Optimization Code/normalized_adjacency.mat
+/Compiler Code/mnist_input_spiketrains
+*.pkl
+*.pyc
+/__pycache__
+/__pychache__/*.pyc
+/Partitioning Code/hier files/
+*.lock

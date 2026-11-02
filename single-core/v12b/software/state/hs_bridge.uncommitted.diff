@@ -1,0 +1,364 @@
+diff --git a/hs_bridge/FPGA_Execution/fpga_compiler.py b/hs_bridge/FPGA_Execution/fpga_compiler.py
+index 7319167..b66bff1 100644
+--- a/hs_bridge/FPGA_Execution/fpga_compiler.py
++++ b/hs_bridge/FPGA_Execution/fpga_compiler.py
+@@ -374,7 +374,8 @@ class fpga_compiler:
+         {op[2:0], dest[12:0], weight[15:0], delay[5:0], syn_type[3:0],
+          stdp_tag[3:0], src[17:0]}   -- matches internal_events_processor.v
+ 
+-        Accepts (op, dest, weight) or (op, dest, weight, delay, src).
++        Accepts (op, dest, weight), (op, dest, weight, delay, src) or (op, dest, weight, delay, src, rule):
++        rule = plasticity rule slot 1..15 written to stdp_tag (0 or absent = static synapse).
+         """
+         # A 5-tuple carries its own delay; a 3-tuple falls back to the
+         # network-wide default, which is how delay is specified until the
+@@ -388,8 +389,15 @@ class fpga_compiler:
+                     + np.binary_repr(int(w[1]) & 0x1FFFF, 17))
+         if w[0] != 0:
+             raise ValueError("unhandled synapse opcode %r" % (w[0],))
+-        delay = int(w[3]) if len(w) > 3 else getattr(self, 'syn_delay', 0)
+-        src   = int(w[4]) if len(w) > 4 else 0
++        # empty slot: compile_network fills unused columns with the placeholder (0, 0, 0).  It is not a synapse
++        # and must not carry the network-wide delay (with syn_delay > 0 every empty slot became a delayed weight-0 entry)
++        if len(w) == 3 and tuple(int(x) for x in w) == (0, 0, 0):
++            return np.binary_repr(0, 64)
++        delay = int(w[3]) if len(w) > 3 and w[3] is not None else getattr(self, 'syn_delay', 0)
++        src   = int(w[4]) if len(w) > 4 and w[4] is not None else 0
++        tag   = int(w[5]) if len(w) > 5 else 0
++        if not 0 <= tag <= 15:
++            raise ValueError("plasticity rule slot %d outside 0-15" % tag)
+         if not 0 <= delay <= 63:
+             raise ValueError("synapse delay %d outside 0-63" % delay)
+         return (np.binary_repr(0, SYN_OP_BITS)
+@@ -397,7 +405,7 @@ class fpga_compiler:
+                 + np.binary_repr(int(w[2]), SYN_WEIGHT_BITS)
+                 + np.binary_repr(delay, 6)
+                 + np.binary_repr(0, 4)          # syn_type, reserved
+-                + np.binary_repr(0, 4)          # stdp_tag, single global rule
++                + np.binary_repr(tag, 4)        # stdp_tag: plasticity rule slot, 0 = static
+                 + np.binary_repr(src, 18))
+ 
+     def _create_synapses_64(self, simDump = False):
+@@ -443,6 +451,38 @@ class fpga_compiler:
+             dmadump.dma_dump_write(element, len(element), 1, 0, 0, 0,
+                                    dmadump.DmaMethodNormal)
+ 
++    @staticmethod
++    def _parse_write(h):
++        """CMD 2 write packet (simDump hex, most significant byte first) -> (row, 256-bit value)."""
++        b = bytes.fromhex(h)
++        addr = int.from_bytes(b[29:32], 'big')
++        if b[0] != 2 or not (addr >> 23) & 1:
++            raise ValueError("not a CMD 2 write packet")
++        return addr & 0x7FFFFF, int.from_bytes(b[32:64], 'big')
++
++    def _write_packet(self, row, value):
++        a = '1' + np.binary_repr(row, 23)
++        cmd = self.HBM_OP_RW_LIST + [int(a[:8], 2), int(a[8:16], 2), int(a[16:], 2)] + list(value.to_bytes(32, 'big'))
++        return np.flip(np.array(cmd, dtype=np.uint64))
++
++    def plasticity_rows(self, n_axons, n_neurons, free_row=None):
++        """Plasticity layout for this core (64-bit synapses only).  Returns (packets, cfg_pairs, image, new_rows):
++        CMD 2 write packets for the extra rows, the base-register pairs for opcode 19, the compiled image as written
++        (src filled on plastic entries; those synapse rows are included in the packets), and the extra rows."""
++        from hs_bridge.FPGA_Execution import plasticity as PL
++        image = {}
++        for h in (self.create_axon_ptrs(simDump=True, syn_64bit=True) + self.create_neuron_ptrs(simDump=True, syn_64bit=True)
++                  + self._create_synapses_64(simDump=True)):
++            r, v = self._parse_write(h if isinstance(h, str) else h[0])
++            image[r] = v
++        before = dict(image)
++        if free_row is None:
++            free_row = max(image) + 1 if image else 0
++        new, pairs = PL.layout(image, n_axons, n_neurons, free_row)
++        rows = dict(new)
++        rows.update({r: v for r, v in image.items() if before.get(r) != v})   # synapse rows whose src was filled
++        return [self._write_packet(r, v) for r, v in sorted(rows.items())], pairs, image, new
++
+     def create_script(self, fname, simDump = False, syn_64bit = False,
+                       syn_delay = 0):
+         # Recorded before any emit so _syn64_entry can see it.  Delay only
+@@ -466,6 +506,17 @@ class fpga_compiler:
+         axon_ptrs = self.create_axon_ptrs(simDump, syn_64bit)
+         neuron_ptrs = self.create_neuron_ptrs(simDump, syn_64bit)
+         synapses = self.create_synapses(simDump, syn_64bit)
++        # delay-slot capacity check: a slot holds 1023 entries per core, and every delayed entry can land on one step
++        if syn_64bit:
++            _nd = sum(1 for _d in self.synapses for _w in _d
++                      if len(_w) >= 3 and _w[0] == 0
++                      and not (len(_w) == 3 and tuple(int(_x) for _x in _w) == (0, 0, 0))
++                      and (int(_w[3]) if (len(_w) > 3 and _w[3] is not None)   # sw fix: None (plastic / unset) is not a delay
++                           else (getattr(self, 'syn_delay', 0) or 0)) > 0)
++            if _nd > 1023:
++                _msg = ('core image has %d delayed synapse entries; a delay slot holds 1023 per core, so if more than '
++                        '1023 arrive on the same step the excess is refused (error_status bit 18)' % _nd)
++                warnings.warn(_msg); logging.warning(_msg)
+ 
+         if simDump:
+             return axon_ptrs, neuron_ptrs, synapses
+diff --git a/hs_bridge/FPGA_Execution/fpga_controller.py b/hs_bridge/FPGA_Execution/fpga_controller.py
+index 1774f69..d027ad1 100755
+--- a/hs_bridge/FPGA_Execution/fpga_controller.py
++++ b/hs_bridge/FPGA_Execution/fpga_controller.py
+@@ -197,7 +197,69 @@ def clear_address_packet(row,col,simDump=False):
+     return packet
+ 
+ #@interface.command()
+-def clear(n_internal, simDump = False, coreID = 0):
++# ---- feature word of the bitstream on the card ------------------------------------------------
++# CMD 10 (status read) is answered by every bitstream in use with a FACE_FACE packet; from v10 its
++# bits 447:416 (bytes 52..55) hold [31:16] = 0xF10A and one bit per capability, older bitstreams
++# return zeros there.  Opcodes a bitstream lacks lock one of its cores, so they are only sent when
++# the card reports them.
++FEATURE_MARKER = 0xF10A
++FEAT_CLEAR_PENDING    = 1 << 0   # opcode 18: drop pending delayed / relayed inputs
++FEAT_CMD2_READ        = 1 << 1   # CMD 2 read-back returns the row requested
++FEAT_RELAY_INPUTS     = 1 << 2   # relayed (inter-core) spikes reach the axon banks
++FEAT_AXON_DELAY_TABLE = 1 << 3   # CMD 14 per-axon-row delay table
++_features = {}
++
++def bitstream_features(coreID=0, refresh=False, max_reads=2000):
++    """Feature bits reported by the bitstream for this core (0 for bitstreams without a feature
++    word).  Cached per core: call with refresh=True after flashing a different bitstream."""
++    if coreID in _features and not refresh:
++        return _features[coreID]
++    coreBits = np.binary_repr(coreID,5)+3*'0'
++    cmd = np.array([0]*62 + [int(coreBits, 2), 10], dtype=np.uint64)
++    dmadump.dma_dump_write(cmd, len(cmd), 1, 0, 0, 0, dmadump.DmaMethodNormal)
++    feats = 0
++    for _ in range(max_reads):
++        exitCode, data = dmadump.dma_dump_read(1, 0, 0, 0, dmadump.DmaMethodNormal, 64)
++        b = [int(x) & 0xFF for x in list(data)[:64]]
++        if len(b) == 64 and b[63] == 0xFA and b[62] == 0xCE and b[61] == 0xFA and b[60] == 0xCE:
++            word = b[52] | (b[53] << 8) | (b[54] << 16) | (b[55] << 24)
++            feats = (word & 0xFFFF) if (word >> 16) == FEATURE_MARKER else 0
++            break
++    _features[coreID] = feats
++    return feats
++
++def _cmd14_packet(row, delay, coreID):
++    if not (0 <= row < 8192 and 0 <= delay <= 63):
++        raise ValueError("axon row %d / delay %d out of range (row 0-8191, delay 0-63)" % (row, delay))
++    coreBits = np.binary_repr(coreID,5)+3*'0'
++    v = (row << 6) | delay
++    return np.array([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF] + [0]*59 + [int(coreBits, 2), 14], dtype=np.uint64)
++
++def set_axon_delay(row, delay, simDump=False, coreID=0):
++    """CMD 14: inputs on axon row `row` are applied `delay` timesteps later (0-63).  The delay is
++    per 16-axon row: axons 16*row .. 16*row+15 share it.  Needs a bitstream with CMD 14."""
++    cmd = _cmd14_packet(row, delay, coreID)
++    if simDump:
++        d = ['{:0{width}x}'.format(int(x), width=2) for x in cmd]; d.reverse()
++        return [[''.join(d)]]
++    dmadump.dma_dump_write(cmd, len(cmd), 1, 0, 0, 0, dmadump.DmaMethodNormal)
++
++def reset_axon_delays(n_axons, simDump=False, coreID=0):
++    """Delay 0 on every axon row of a network with n_axons axons, so it does not inherit the
++    delays a previous network set.  Needs a bitstream with CMD 14."""
++    rows = int(np.ceil(n_axons / 16))
++    if rows == 0:
++        return [] if simDump else None
++    cmd = np.concatenate([_cmd14_packet(r, 0, coreID) for r in range(rows)])
++    if simDump:
++        out = []
++        for k in range(rows):
++            d = ['{:0{width}x}'.format(int(x), width=2) for x in cmd[64*k:64*(k+1)]]; d.reverse()
++            out.append([''.join(d)])
++        return out
++    dmadump.dma_dump_write(cmd, len(cmd), 1, 0, 0, 0, dmadump.DmaMethodNormal)
++
++def clear(n_internal, simDump = False, coreID = 0, pending_clear = None):
+     """This function clears the membrane potentials on the fpga.
+     """
+     #updated Feb11
+@@ -207,7 +269,13 @@ def clear(n_internal, simDump = False, coreID = 0):
+     
+     if simDump:
+         dump = []
+-    for i in range(int(np.ceil(n_internal / ng_num))):
++    nrows = int(np.ceil(n_internal / ng_num))
++    # Each neuron's synaptic currents and adaptation are in a second URAM row at row + 4096
++    # (ROW_B_FULL_OFFSET in internal_events_processor.v).  Clear them too, so a newly loaded
++    # network does not inherit the previous network's state.  A network with more than 4096
++    # rows (legacy delta mode only) has no second row; all its rows are in the first range.
++    rows = list(range(nrows)) + ([r + 4096 for r in range(nrows)] if nrows <= 4096 else [])
++    for i in rows:
+         #if simDump:
+         #    commandTail = ' 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ' + coreByte + ' 03'
+         #    numCol = 16
+@@ -241,6 +309,19 @@ def clear(n_internal, simDump = False, coreID = 0):
+             #breakpoint()
+             exitCode = dmadump.dma_dump_write(clearCommand, len(clearCommand), 1, 0, 0, 0, dmadump.DmaMethodNormal)
+ 
++    # Pending inputs (both delay buffers, the axon input banks, the relay FIFO) are dropped by
++    # opcode 18, sent only to a bitstream that reports it.  pending_clear: None = ask the card
++    # (not for simDump), True / False = as given.
++    if pending_clear is None:
++        pending_clear = (not simDump) and bool(bitstream_features(coreID) & FEAT_CLEAR_PENDING)
++    if pending_clear:
++        clr = np.array([0]*62 + [int(coreBits, 2), 18], dtype=np.uint64)
++        if simDump:
++            d = ['{:0{width}x}'.format(int(x), width=2) for x in clr]; d.reverse()
++            dump.append([''.join(d)])
++        else:
++            dmadump.dma_dump_write(clr, len(clr), 1, 0, 0, 0, dmadump.DmaMethodNormal)
++
+     if simDump:
+         return dump
+ 
+@@ -287,6 +368,8 @@ def flush_spikes(coreID = 0):
+     spikeOutput = []
+     n=0
+     time.sleep(800/1000000.0) #wait fourty microseconds for processing of spikes to complete
++    step_timeout = float(os.environ.get("HIAER_STEP_TIMEOUT", "10"))   # seconds; a step ends only at ABCD
++    deadline = time.time() + step_timeout
+     while(True):
+         exitCode, batchRead = dmadump.dma_dump_read(1, 0, 0, 0, dmadump.DmaMethodNormal, 64*packetNum)
+         #breakpoint()
+@@ -301,9 +384,9 @@ def flush_spikes(coreID = 0):
+             if((currentRead[62] == 255) and (currentRead[63] == 255)) or ((currentRead[62] == 204) and (currentRead[63] == 204)):
+                 #FIFO Empty or latched MP
+                 n += 1
+-                if (n == 50):
+-                    flushed = True
+-                    break
++                if time.time() > deadline:
++                    raise TimeoutError("step did not complete within %.1f s: no step-done (ABCD) packet; "
++                                       "set HIAER_STEP_TIMEOUT for longer steps" % step_timeout)
+             elif(currentRead[62] == 238 and currentRead[63] == 238):
+                 #breakpoint()
+                 executionRun_counter, spikeList = read_spikes(currentRead)
+@@ -1083,7 +1166,7 @@ def write_synapse_row(r, row, simDump = False, coreID = 0):
+     '''
+     #breakpoint()
+     #oldCommandPrefix = '02' + '{:0{width}x}'.format(coreID, width=2) + '000000000000000000000000000000000000000000000000000000'
+-    commandPrefix = [2, coreID] + [0]*27
++    commandPrefix = [2, (coreID & 0x1F) << 3] + [0]*27   # core ID in the top five bits, as in every command
+     if simDump:
+         dump = []
+     #oldCmd = ''
+@@ -1115,7 +1198,7 @@ def write_synapse_row(r, row, simDump = False, coreID = 0):
+ 
+     # write to text file
+     if simDump:
+-        dumpCmd = ['{:0{width}x}'.format(i, width=2) for i in clearCommand]
++        dumpCmd = ['{:0{width}x}'.format(int(i), width=2) for i in finalCmd]
+         dumpCmd.reverse()
+         dumpCmd = ''.join(dumpCmd)
+         dump.append(dumpCmd)
+@@ -1156,7 +1239,7 @@ def Read_synapse_row(r, simDump = False, coreID = 0):
+     '''
+     #breakpoint()
+     #oldCommandPrefix = '02' + '{:0{width}x}'.format(coreID, width=2) + '000000000000000000000000000000000000000000000000000000'
+-    commandPrefix = [2, coreID] + [0]*27
++    commandPrefix = [2, (coreID & 0x1F) << 3] + [0]*27   # core ID in the top five bits, as in every command
+     if simDump:
+         dump = []
+     #oldCmd = ''
+@@ -1166,7 +1249,7 @@ def Read_synapse_row(r, simDump = False, coreID = 0):
+     finalCmd = np.flip(np.array(cmd,dtype=np.uint64))
+     # write to text file
+     if simDump:
+-        dumpCmd = ['{:0{width}x}'.format(i, width=2) for i in clearCommand]
++        dumpCmd = ['{:0{width}x}'.format(int(i), width=2) for i in finalCmd]
+         dumpCmd.reverse()
+         dumpCmd = ''.join(dumpCmd)
+         dump.append(dumpCmd)
+diff --git a/hs_bridge/compile_network.py b/hs_bridge/compile_network.py
+index 6d08711..84594bb 100755
+--- a/hs_bridge/compile_network.py
++++ b/hs_bridge/compile_network.py
+@@ -312,6 +312,8 @@ def map_to_hbm_fpga(connectome, n_cores, to_fpga=True):
+                                 weights[w].get_weight(),
+                             )
+                             weights[w].set_index(row_offset, column)
++                            if getattr(weights[w], 'rule', 0):   # plasticity: (op, dest, weight, delay=default, src=layout, rule)
++                                row[column] = tuple(row[column]) + (None, None, int(weights[w].rule))
+ 
+                             used_weights[w] = 0
+ 
+@@ -393,6 +395,8 @@ def map_to_hbm_fpga(connectome, n_cores, to_fpga=True):
+                                 weights[w].get_weight(),
+                             )
+                             weights[w].set_index(row_offset, column)
++                            if getattr(weights[w], 'rule', 0):   # plasticity: (op, dest, weight, delay=default, src=layout, rule)
++                                row[column] = tuple(row[column]) + (None, None, int(weights[w].rule))
+                             used_weights[w] = 0
+ 
+                 row = [r if r != 0 else (0, 0, 0) for r in row]
+diff --git a/hs_bridge/network.py b/hs_bridge/network.py
+index 0c2b85b..e4b385b 100644
+--- a/hs_bridge/network.py
++++ b/hs_bridge/network.py
+@@ -1,5 +1,6 @@
+ from hs_bridge.compile_network import compileNetwork
+ from hs_bridge.FPGA_Execution.fpga_compiler import fpga_compiler
++from hs_bridge.FPGA_Execution import plasticity as PL
+ import subprocess
+ import numpy as np
+ import time
+@@ -7,7 +8,7 @@ import functools
+ import operator
+ import logging
+ from hs_bridge.config import *
+-from hs_bridge.FPGA_Execution.fpga_controller import readSelect, write_parameters_simple, write_neuron_type, clear, step_input, read, execute, write_synapse_row, input_user, flush_spikes, clear_read_buffer, cont_execute, cont_execute_sim_overide
++from hs_bridge.FPGA_Execution.fpga_controller import readSelect, write_parameters_simple, write_neuron_type, clear, step_input, read, execute, write_synapse_row, input_user, flush_spikes, clear_read_buffer, cont_execute, cont_execute_sim_overide, bitstream_features, reset_axon_delays, FEAT_AXON_DELAY_TABLE
+ 
+ class network:
+     """A class for creating networks to be run on the CRI hardware
+@@ -28,7 +29,11 @@ class network:
+ 
+     def __init__(self, connectome, outputs, simDump = False, coreOveride = 0,
+                  syn_64bit = False, syn_delay = 0, membership = None,
+-                 n_cores = None):
++                 n_cores = None, plasticity = None):
++        # plasticity = {'rules': {slot: Rule}, 'tables': {table: [4096 values]}} (64-bit synapses only)
++        self.plasticity = plasticity
++        if plasticity and not syn_64bit:
++            raise ValueError("plasticity needs syn_64bit=True (rule slots live in the 64-bit synapse entries)")
+         self.coreOveride = coreOveride #TODO:this is for debugging
+         # 64-bit Phase-2 synapse entries: doubles HBM footprint, needed for
+         # per-synapse delay and STDP.  Must match syn_64bit_en in CMD 13.
+@@ -121,6 +126,9 @@ class network:
+                 self.cmdDump.append(axon_ptrs)
+                 self.cmdDump.append(neuron_ptrs)
+                 self.cmdDump.append(synapses)
++                if self.plasticity:
++                    self.cmdDump.append([PL.packet_hex(p) for p in PL.load_packets(compiler, self.core_num_inputs[core],
++                        self.core_num_outputs[core], self.plasticity.get('rules', {}), self.plasticity.get('tables', {}), coreID=tgt)])
+                 global_cmd = write_parameters_simple(n_outputs=self.core_num_outputs[core], n_inputs=self.core_num_inputs[core], coreID=tgt, simDump = True)
+                 self.cmdDump.append(global_cmd)
+                 for neuronModel, cutoff in zip(self.models, cutoffs):
+@@ -130,12 +138,32 @@ class network:
+                 self.cmdDump=self.cmdDump+clear_cmd
+             else:
+                 compiler.create_script("test_config", syn_64bit = self.syn_64bit, syn_delay = self.syn_delay)
++                if self.plasticity:
++                    if not (bitstream_features(tgt) & PL.FEAT_PLASTICITY):
++                        raise RuntimeError("plasticity requested, but the bitstream on core %d does not report it (feature bit 4)" % tgt)
++                    PL.send(PL.load_packets(compiler, self.core_num_inputs[core], self.core_num_outputs[core],
++                                            self.plasticity.get('rules', {}), self.plasticity.get('tables', {}), coreID=tgt))
++                    self.plasticity_bases = getattr(self, 'plasticity_bases', {})
++                    self.plasticity_bases[tgt] = compiler.plasticity_bases      # HBM layout, for read-back
+                 write_parameters_simple(n_outputs=self.core_num_outputs[core], n_inputs=self.core_num_inputs[core], coreID=tgt)
+                 for neuronModel, cutoff in zip(self.models, cutoffs):
+                     write_neuron_type(cutoff, neuronModel.get_threshold(), neuronModel.get_neuronModel(), neuronModel.get_shift(), neuronModel.get_leak(), refractory_max=neuronModel.get_refractory_max(), dual_synapse_en=neuronModel.get_dual_synapse_en(), delay_value=neuronModel.get_delay_value(), shadow_uram_offset=neuronModel.get_shadow_uram_offset(), legacy_noise_en=neuronModel.get_legacy_noise_en(), soft_reset_en=neuronModel.get_soft_reset_en(), coreID=tgt)
+                 clear(self.core_num_outputs[core], coreID = tgt)
++                # a new network starts with delay 0 on its axon rows (only where the card has CMD 14)
++                if bitstream_features(tgt) & FEAT_AXON_DELAY_TABLE:
++                    reset_axon_delays(self.core_num_inputs[core], coreID = tgt)
+         self.stepNum = 0
+ 
++    def reward(self, R):
++        """Opcode 20: reward R (signed Q8.8 weight units) to every core with plasticity; eligibility rules apply it."""
++        if not self.plasticity:
++            raise RuntimeError("network was built without plasticity")
++        pk = [PL.reward_packet(int(R), coreID=self.core_target[c]) for c in self.cores]
++        if self.simDump:
++            self.cmdDump.append([PL.packet_hex(p) for p in pk])
++        else:
++            PL.send(pk)
++
+     def set_perturbMag(self,perturbMag):
+         if self.simDump:
+                 #breakpoint()

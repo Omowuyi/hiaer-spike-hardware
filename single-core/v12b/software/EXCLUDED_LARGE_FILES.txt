@@ -1,0 +1,22 @@
+Files over 5 MB left out of this snapshot (complete copies are in the software backup v12b_software_20261101_1615.tar.gz):
+      10.4 MB  hs_api/examples/CRI_Mapping/chris_code/converter_testing/IFNeuron/checkpoint_max_T_10_C_4_lr_0.001.pth  md5 2615f308c4b7263b2e7fd077a0c9547e
+       6.3 MB  hs_api/tests/pytest_L6d_fulldataset.log  md5 5f4d71df7ebe8e0d4bcd8783a0cb8290
+       6.3 MB  hs_api/tests/pytest_L6k_fullmodel.log  md5 3707a13a29cab50777496c202abba5f6
+       6.5 MB  hs_api/tests/pytest_L6l_fullmodel.log  md5 4f6d8916822950f7f9d4d552619baed8
+       6.3 MB  hs_api/tests/pytest_L6j_fulldataset.log  md5 46f729e19923a5fe5d3e37c47392d522
+       6.5 MB  hs_api/tests/pytest_L6e_fulldataset.log  md5 780ad7cae613211502fd7bdce37d4f30
+       5.9 MB  hs_api/tests/pytest_L6c_largeDVS.log  md5 9a2fcc7972748971f66cb9123a2347f5
+       6.4 MB  hs_api/tests/pytest_L6j_dvs_2024.log  md5 15695c9779cae902f0754065c99022fc
+     116.0 MB  hs_api/tests/fixtures/CIFAR10_model_config_shift=0.pkl  md5 ac67eb31c163006582b4b99df3a85003
+     574.9 MB  hs_api/tests/fixtures/DVS_model_config_shift=0.pkl  md5 8f0c39da5bc5e57dd9b8e12ad8af2ccf
+      87.3 MB  hs_api/tests/fixtures/DVS_full_dataset.pkl  md5 062060388418eeeed2099a02926ff5e1
+      12.6 MB  hs_api/tests/fixtures/DVS_model_ch=10_conv=2_IFneuron.pkl  md5 70fde135f4397c0ed4bfa0b260d95379
+     116.0 MB  hs_api/tests/fixtures/CIFAR10_model_config_shift=-17.pkl  md5 dd327d1fa3bf8b745111607d32cfcc53
+     574.9 MB  hs_api/tests/fixtures/DVS_model_config_shift=-17.pkl  md5 5af7978277def71359580b7cb28aea6d
+      14.5 MB  hs_api/tests/fixtures/DVS_test_batch_2024vsL6.pkl  md5 80db98cbfdb282447f70bf411f4d8002
+       6.3 MB  hs_api/tests/pytest_mc4_dvs_large_core0.log  md5 2b1e8514495e7bd55c0244845172061b
+       6.4 MB  hs_api/tests/pytest_L6j_dvs.log  md5 ada64ba3bf70ba4843e5db4f8c8463e1
+       6.0 MB  hs_api/tests/pytest_2024_baseline.log  md5 782752d46b9103b86bbf366354ccb53c
+       6.3 MB  hs_api/tests/pytest_L6j_fullmodel.log  md5 8edc5d6bdea3894ac918ad37e32e558b
+       8.2 MB  hs_api/tests/pytest_2024hw_fullmodel.log  md5 e80327abe0f72453e2d0f63b0029caac
+       6.3 MB  hs_api/tests/pytest_L6m_dvs.log  md5 2fc0b861a926e6f175898194145ccc81

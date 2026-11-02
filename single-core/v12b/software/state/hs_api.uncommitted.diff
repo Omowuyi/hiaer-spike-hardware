@@ -1,0 +1,609 @@
+diff --git a/hs_api/api.py b/hs_api/api.py
+index 055695b..a99c3c8 100644
+--- a/hs_api/api.py
++++ b/hs_api/api.py
+@@ -61,7 +61,7 @@ class CRI_network:
+     # TODO: move target config.yaml
+     def __init__(
+             self, axons, connections, outputs, target=None, simDump=False, coreID=0,
+-            syn_64bit=False, syn_delay=0, membership=None, n_cores=None
++            syn_64bit=False, syn_delay=0, membership=None, n_cores=None, plasticity=None
+     ):
+         # return
+         # breakpoint()
+@@ -83,7 +83,7 @@ class CRI_network:
+         if type(axons) == dict:
+             for keys in axons:
+                 for values in axons[keys]:
+-                    if not ((type(values) == tuple) and (len(values) in (2, 3))):
++                    if not ((type(values) == tuple) and (len(values) in (2, 3, 4))):
+                         logging.error(
+                             "Each synapse should only consists of 2 elements: neuron, weight"
+                         )
+@@ -99,7 +99,7 @@ class CRI_network:
+                     for values in connections[keys][
+                         synapseIdx
+                     ]:  # synapse list is first element in tuple
+-                        if not ((type(values) == tuple) and (len(values) in (2, 3))):
++                        if not ((type(values) == tuple) and (len(values) in (2, 3, 4))):
+                             logging.error(
+                                 "Each synapse should only consists of 2 elements: neuron, weight"
+                             )
+@@ -154,6 +154,7 @@ class CRI_network:
+                 syn_delay=syn_delay,
+                 membership=membership,
+                 n_cores=n_cores,
++                plasticity=plasticity,
+             )
+             self.CRI.initalize_network()
+             self._load_noc_routing()
+@@ -245,10 +246,11 @@ class CRI_network:
+             synapses = self.userAxons[axonKey]
+             for axonSynapse in synapses:
+                 weight = axonSynapse[1]
+-                delayed = axonSynapse[2] if len(axonSynapse) == 3 else False
++                delayed = axonSynapse[2] if len(axonSynapse) >= 3 else False
++                rule = axonSynapse[3] if len(axonSynapse) == 4 else 0     # plasticity rule slot
+                 postsynapticNeuron = self.connectome.connectomeDict[axonSynapse[0]]
+                 self.connectome.connectomeDict[axonKey].addSynapse(
+-                    postsynapticNeuron, weight, delayed=delayed
++                    postsynapticNeuron, weight, delayed=delayed, rule=rule
+                 )
+         # print("added axon synpases")
+         for neuronKey in self.userConnections:
+@@ -257,10 +259,11 @@ class CRI_network:
+             # breakpoint()
+             for neuronSynapse in synapses:
+                 weight = neuronSynapse[1]
+-                delayed = neuronSynapse[2] if len(neuronSynapse) == 3 else False
++                delayed = neuronSynapse[2] if len(neuronSynapse) >= 3 else False
++                rule = neuronSynapse[3] if len(neuronSynapse) == 4 else 0     # plasticity rule slot
+                 postsynapticNeuron = self.connectome.connectomeDict[neuronSynapse[0]]
+                 self.connectome.connectomeDict[neuronKey].addSynapse(
+-                    postsynapticNeuron, weight, delayed=delayed
++                    postsynapticNeuron, weight, delayed=delayed, rule=rule
+                 )
+         # print("added neuron synapses")
+ 
+@@ -567,6 +570,40 @@ class CRI_network:
+             logging.error("NoC routing tables were NOT loaded (%s) -- the "
+                           "network will run with every core isolated", e)
+ 
++    def reward(self, R):
++        """Plasticity: reward R (signed, Q8.8 weight units) to every core; eligibility rules apply it."""
++        self.CRI.reward(R)
++
++    def _spike_keys(self, spikeList):
++        """Reported spikes (counter, per-core index, core) -> neuron keys.  An address that belongs to no neuron of this
++        network is counted in self.unknown_spikes, logged, and left out; a nonzero count means the card reported
++        something it should not have."""
++        keys = []
++        for spike in spikeList:
++            core = spike[2] if len(spike) > 2 else 0
++            n = self.connectome.get_neuron_by_core_idx(core, spike[1])
++            if n is None:
++                self.unknown_spikes = getattr(self, 'unknown_spikes', 0) + 1
++                logging.warning('spike from core %d address %d belongs to no neuron of this network '
++                                '(unknown spikes so far: %d)' % (core, spike[1], self.unknown_spikes))
++                continue
++            keys.append(n.get_user_key())
++        return keys
++
++    def _cont_spike_keys(self, spikeList):
++        """run_cont spikes (step counter, index) -> (step counter, key); an unknown index is counted and logged as in
++        _spike_keys."""
++        out = []
++        for spike in spikeList:
++            n = self.connectome.get_neuron_by_idx(spike[1])
++            if n is None:
++                self.unknown_spikes = getattr(self, 'unknown_spikes', 0) + 1
++                logging.warning('run_cont: spike at index %d belongs to no neuron of this network '
++                                '(unknown spikes so far: %d)' % (spike[1], self.unknown_spikes))
++                continue
++            out.append((spike[0], n.get_user_key()))
++        return out
++
+     def step(self, inputs, target="simpleSim", membranePotential=False):
+         """
+         Runs a step of the simulation.
+@@ -647,12 +684,7 @@ class CRI_network:
+                     # we currently ignore the run execution counter.  A spike is
+                     # (counter, per-core index, core); the pair identifies the
+                     # neuron, the index alone does not.
+-                    spikeList = [
+-                        self.connectome.get_neuron_by_core_idx(
+-                            spike[2] if len(spike) > 2 else 0,
+-                            spike[1]).get_user_key()
+-                        for spike in spikeList
+-                    ]
++                    spikeList = self._spike_keys(spikeList)
+                     for sk in spikeList:
+                         if sk in self._delay_map:
+                             for ak, dv in self._delay_map[sk]:
+@@ -669,12 +701,7 @@ class CRI_network:
+                     spikeResult = self.CRI.run_step(formated_inputs, membranePotential)
+                     # breakpoint()
+                     spikeList = spikeResult[0]
+-                    spikeList = [
+-                        self.connectome.get_neuron_by_core_idx(
+-                            spike[2] if len(spike) > 2 else 0,
+-                            spike[1]).get_user_key()
+-                        for spike in spikeList
+-                    ]
++                    spikeList = self._spike_keys(spikeList)
+                     for sk in spikeList:
+                         if sk in self._delay_map:
+                             for ak, dv in self._delay_map[sk]:
+@@ -721,9 +748,6 @@ class CRI_network:
+         spikeList = result[0]
+         # breakpoint()
+         if self.simDump == False:
+-            spikeList = [
+-                (spike[0], self.connectome.get_neuron_by_idx(spike[1]).get_user_key())
+-                for spike in spikeList
+-            ]
++            spikeList = self._cont_spike_keys(spikeList)
+             return (spikeList, result[1], result[2])
+         
+diff --git a/tests/test_bio_features_hw.py b/tests/test_bio_features_hw.py
+index 64ab087..3ddb56a 100644
+--- a/tests/test_bio_features_hw.py
++++ b/tests/test_bio_features_hw.py
+@@ -45,8 +45,10 @@ _TRACES = os.environ.get("HIAER_BIO_TRACES")
+ BIG = 1_000_000
+ EVERY = lambda n: list(range(n))
+ 
+-# Every test uses a different threshold: a threshold change makes the core clear all
+-# neuron state (V and the synaptic currents) on the next step, so nothing carries over.
++# Each test loads its own network; the load runs clear(), which zeroes V and the Row B state (synaptic currents,
++# adaptation) and, where the bitstream supports opcode 18, drops pending delayed inputs.  Each test then runs 8 idle
++# steps in the biological mode before applying its own CMD 13.  The per-test threshold only keeps the records
++# distinguishable; changing a threshold does not clear state.
+ CONTROL = dict(id="F00", name="control_delta_mode", cmd13=dict(delta_mode=1),
+                syn={"A0": 1000}, sched={"A0": [0]}, theta=BIG + 0, steps=8)
+ 
+@@ -105,6 +107,10 @@ def _hardware(f):
+                       syn_64bit=f.get("syn_64bit", False), syn_delay=f.get("syn_delay", 0))
+     if f.get("syn_64bit"):
+         net.CRI.compiledNetwork.create_synapses(syn_64bit=True)  # write synapses again in 64-bit format
++    # drain what the previous test left: 8 idle biological-mode steps (this network's load already ran clear())
++    p2.send_cmd13_psc_params(coreID=_CORE_ID, delta_mode=0)
++    for _ in range(8):
++        net.step([])
+     p2.send_cmd13_psc_params(coreID=_CORE_ID, **f["cmd13"])
+     hw, spikes = [], []
+     try:
+diff --git a/tests/test_bitstream_hardware.py b/tests/test_bitstream_hardware.py
+index e9b5d88..3fdd990 100644
+--- a/tests/test_bitstream_hardware.py
++++ b/tests/test_bitstream_hardware.py
+@@ -185,7 +185,11 @@ class TestBitStream:
+         mp2_dict = dict(mp2)
+ 
+         assert len(currSpikes1[0]) == 0
+-        assert len(currSpikes2[0]) != 0
++        names = [s[1] if isinstance(s, (tuple, list)) else s for s in currSpikes2[0]]
++        missing = sorted(set(f"N1.{i}" for i in range(numberAxons)) - set(names), key=lambda k: int(k.split(".")[1]))
++        assert len(names) == numberAxons and not missing, (
++            "step 1: %d spikes (%d distinct), expected %d; first missing: %s" % (len(names), len(set(names)), numberAxons,
++            [(m, "row %d grp %d" % (int(m.split(".")[1]) // 16, int(m.split(".")[1]) % 16)) for m in missing[:6]]))
+ 
+         for i in range(numberAxons):
+              neuron_name = f"N1.{i}"
+diff --git a/tests/test_bitstream_hardware_fast.py b/tests/test_bitstream_hardware_fast.py
+index c12e556..c5d1ba9 100644
+--- a/tests/test_bitstream_hardware_fast.py
++++ b/tests/test_bitstream_hardware_fast.py
+@@ -190,7 +190,11 @@ class TestBitStream:
+         mp2_dict = dict(mp2)
+ 
+         assert len(currSpikes1[0]) == 0
+-        assert len(currSpikes2[0]) != 0
++        names = [s[1] if isinstance(s, (tuple, list)) else s for s in currSpikes2[0]]
++        missing = sorted(set(f"N1.{i}" for i in range(numberAxons)) - set(names), key=lambda k: int(k.split(".")[1]))
++        assert len(names) == numberAxons and not missing, (
++            "step 1: %d spikes (%d distinct), expected %d; first missing: %s" % (len(names), len(set(names)), numberAxons,
++            [(m, "row %d grp %d" % (int(m.split(".")[1]) // 16, int(m.split(".")[1]) % 16)) for m in missing[:6]]))
+ 
+         for i in range(numberAxons):
+              neuron_name = f"N1.{i}"
+@@ -545,7 +549,7 @@ class TestBitStream:
+             Sum of absolute value of MPs over 100 timesteps > 0 (noise present)
+             
+         Explanation:
+-            For shift values other than -17, the LIF neuron should inject
++            For shift values above -16, the LIF neuron should inject (-16 and -17: no noise)
+             noise into the membrane potential. Even with no axonal input, the 
+             neuron's MP should fluctuate due to the noise injection. Over 100
+             time steps, the cumulative sum should be nonzero, demonstrating that noise
+@@ -567,7 +571,11 @@ class TestBitStream:
+             mp_sum += abs(mp[0][1])  # Add absolute MP value to sum
+         
+         # Test passes if total MP sum is 0
+-        assert mp_sum > 0, f"Shift={shift}: Expected MP sum to be nonzero, got {mp_sum}"
++        if shift <= -16:
++            # specification: shift -16 and -17 inject no noise (noise spec fix)
++            assert mp_sum == 0, f"Shift={shift}: Expected no noise (MP sum 0), got {mp_sum}"
++        else:
++            assert mp_sum > 0, f"Shift={shift}: Expected MP sum to be nonzero, got {mp_sum}"
+ 
+     def test_network_reset(self, setup_dictionaries):
+         """Test network reset without running flash.sh by running two different networks back-to-back
+diff --git a/vivado.jou b/vivado.jou
+index 4528cc0..6bdbf9c 100644
+--- a/vivado.jou
++++ b/vivado.jou
+@@ -3,10 +3,10 @@
+ # SW Build 5076996 on Wed May 22 18:36:09 MDT 2024
+ # IP Build 5075265 on Wed May 22 21:45:21 MDT 2024
+ # SharedData Build 5076995 on Wed May 22 18:29:18 MDT 2024
+-# Start of session at: Wed Jul 22 16:12:00 2026
+-# Process ID: 48275
++# Start of session at: Sun Nov  1 15:58:27 2026
++# Process ID: 3050184
+ # Current directory: /home/omowuyi/testing/hs_api
+-# Command line: vivado -mode batch -source /bitstreams/progbit.tcl
++# Command line: vivado -mode batch -source /bitstreams/scripts/progbit.tcl -tclargs /bitstreams/sixteen_core_noc_v12b_ila.bit
+ # Log file: /home/omowuyi/testing/hs_api/vivado.log
+ # Journal file: /home/omowuyi/testing/hs_api/vivado.jou
+ # Running On        :crisdsc0.ucsd.edu
+@@ -19,6 +19,6 @@
+ # Host memory       :1081498 MB
+ # Swap memory       :0 MB
+ # Total Virtual     :1081498 MB
+-# Available Virtual :1075318 MB
++# Available Virtual :1069707 MB
+ #-----------------------------------------------------------
+-source /bitstreams/progbit.tcl
++source /bitstreams/scripts/progbit.tcl
+diff --git a/vivado.log b/vivado.log
+index 9600959..66f5edf 100644
+--- a/vivado.log
++++ b/vivado.log
+@@ -3,10 +3,10 @@
+ # SW Build 5076996 on Wed May 22 18:36:09 MDT 2024
+ # IP Build 5075265 on Wed May 22 21:45:21 MDT 2024
+ # SharedData Build 5076995 on Wed May 22 18:29:18 MDT 2024
+-# Start of session at: Wed Jul 22 16:12:00 2026
+-# Process ID: 48275
++# Start of session at: Sun Nov  1 15:58:27 2026
++# Process ID: 3050184
+ # Current directory: /home/omowuyi/testing/hs_api
+-# Command line: vivado -mode batch -source /bitstreams/progbit.tcl
++# Command line: vivado -mode batch -source /bitstreams/scripts/progbit.tcl -tclargs /bitstreams/sixteen_core_noc_v12b_ila.bit
+ # Log file: /home/omowuyi/testing/hs_api/vivado.log
+ # Journal file: /home/omowuyi/testing/hs_api/vivado.jou
+ # Running On        :crisdsc0.ucsd.edu
+@@ -19,12 +19,41 @@
+ # Host memory       :1081498 MB
+ # Swap memory       :0 MB
+ # Total Virtual     :1081498 MB
+-# Available Virtual :1075318 MB
++# Available Virtual :1069707 MB
+ #-----------------------------------------------------------
+-source /bitstreams/progbit.tcl
+-# open_hw_manager
+-open_hw_manager: Time (s): cpu = 00:00:08 ; elapsed = 00:00:08 . Memory (MB): peak = 1654.008 ; gain = 67.828 ; free physical = 1022483 ; free virtual = 1025158
+-# connect_hw_server -url localhost:3121
++source /bitstreams/scripts/progbit.tcl
++# if {$argc < 1 || $argc > 2} {
++#     puts "Usage: $argv0 <bitfile_path> \[ltxfile_path\]"
++#     puts "Example: $argv0 /path/to/file.bit /path/to/file.ltx"
++#     exit 1
++# }
++# set bitfile [lindex $argv 0]
++# set ltxfile [expr {$argc == 2 ? [lindex $argv 1] : ""}]
++# if {![file exists $bitfile]} {
++#     puts "Error: Bitfile '$bitfile' does not exist"
++#     exit 1
++# }
++# if {$ltxfile ne "" && ![file exists $ltxfile]} {
++#     puts "Error: LTX file '$ltxfile' does not exist"
++#     exit 1
++# }
++# set hw_server_url "localhost:3121"
++# set target_device "xcvu37p_0"
++# set programming_freq 5000000
++# set target_serial "210308B09B70"
++# puts "Opening hardware manager..."
++Opening hardware manager...
++# if {[catch {open_hw_manager} err]} {
++#     puts "Error: Failed to open hardware manager: $err"
++#     exit 1
++# }
++open_hw_manager: Time (s): cpu = 00:00:08 ; elapsed = 00:00:08 . Memory (MB): peak = 1659.422 ; gain = 2.016 ; free physical = 969614 ; free virtual = 1019780
++# puts "Connecting to hardware server at $hw_server_url..."
++Connecting to hardware server at localhost:3121...
++# if {[catch {connect_hw_server -url $hw_server_url} err]} {
++#     puts "Error: Failed to connect to hardware server: $err"
++#     exit 1
++# }
+ INFO: [Labtools 27-2285] Connecting to hw_server url TCP:localhost:3121
+ INFO: [Labtools 27-2222] Launching hw_server...
+ INFO: [Labtools 27-2221] Launch Output:
+@@ -50,9 +79,83 @@ OSError: [Errno 22] Invalid argument
+ 
+ 
+ 
+-# set_property PARAM.FREQUENCY 5000000 [get_hw_targets */xilinx_tcf/Digilent/210308B09B70]
+-# open_hw_target
++# puts "Setting programming frequency to $programming_freq Hz..."
++Setting programming frequency to 5000000 Hz...
++# if {[catch {
++#     set_property PARAM.FREQUENCY $programming_freq [get_hw_targets */xilinx_tcf/Digilent/$target_serial]
++# } err]} {
++#     puts "Error: Failed to set frequency: $err"
++#     exit 1
++# }
++# puts "Opening hardware target..."
++Opening hardware target...
++# if {[catch {open_hw_target} err]} {
++#     puts "Error: Failed to open hardware target: $err"
++#     exit 1
++# }
+ INFO: [Labtoolstcl 44-466] Opening hw_target localhost:3121/xilinx_tcf/Digilent/210308B09B70
+-# set_property PROGRAM.FILE {single_core_conductance_STDP.bit} [lindex [get_hw_devices xcvu37p_0] 0]
+-ERROR: [Labtools 27-2149] File single_core_conductance_STDP.bit not found. Check file name and file permissions.
+-INFO: [Common 17-206] Exiting Vivado at Wed Jul 22 16:12:17 2026...
++# set device [lindex [get_hw_devices $target_device] 0]
++# if {$device eq ""} {
++#     puts "Error: Device $target_device not found"
++#     exit 1
++# }
++# puts "Setting bitfile: [file tail $bitfile]"
++Setting bitfile: sixteen_core_noc_v12b_ila.bit
++# if {[catch {set_property PROGRAM.FILE $bitfile $device} err]} {
++#     puts "Error: Failed to set bitfile: $err"
++#     exit 1
++# }
++# if {$ltxfile ne ""} {
++#     puts "Setting probes file: [file tail $ltxfile]"
++#     if {[catch {set_property PROBES.FILE $ltxfile $device} err]} {
++#         puts "Error: Failed to set probes file: $err"
++#         exit 1
++#     }
++# } else {
++#     puts "No probes file provided, skipping"
++# }
++No probes file provided, skipping
++# current_hw_device $device
++# refresh_hw_device $device
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 HBM core(s).
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 2 ILA core(s).
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 VIO core(s).
++WARNING: [Labtools 27-1347] Unable to find Debug Probes file []. Please update hw_device property [PROBES.FILE]
++ Update of hw_probe objects, will be skipped.
++WARNING: [Labtools 27-1974] Mismatch between the design programmed into the device xcvu37p_0 and the probes file(s) .
++The device design has 2 ILA core(s) and 1 VIO core(s). 0 ILA core(s) and 0 VIO core(s) are matched in the probes file(s).
++Resolution: 
++1. Reprogram device with the correct programming file and associated probes file(s) OR
++2. Goto device properties and associate the correct probes file(s) with the programming file already programmed in the device.
++# puts "Programming Device $target_device with [file tail $bitfile]..."
++Programming Device xcvu37p_0 with sixteen_core_noc_v12b_ila.bit...
++# if {[catch {program_hw_devices $device} err]} {
++#     puts "Error: Programming failed: $err"
++#     exit 1
++# }
++INFO: [Labtools 27-3164] End of startup status: HIGH
++program_hw_devices: Time (s): cpu = 00:01:59 ; elapsed = 00:01:59 . Memory (MB): peak = 1708.613 ; gain = 0.000 ; free physical = 969513 ; free virtual = 1019729
++# puts "Programming verification: startup status HIGH (DONE)"
++Programming verification: startup status HIGH (DONE)
++# puts "Waiting for device to stabilize..."
++Waiting for device to stabilize...
++# after 5000
++# refresh_hw_device $device
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 HBM core(s).
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 2 ILA core(s).
++INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 VIO core(s).
++WARNING: [Labtools 27-1347] Unable to find Debug Probes file []. Please update hw_device property [PROBES.FILE]
++ Update of hw_probe objects, will be skipped.
++WARNING: [Labtools 27-1974] Mismatch between the design programmed into the device xcvu37p_0 and the probes file(s) .
++The device design has 2 ILA core(s) and 1 VIO core(s). 0 ILA core(s) and 0 VIO core(s) are matched in the probes file(s).
++Resolution: 
++1. Reprogram device with the correct programming file and associated probes file(s) OR
++2. Goto device properties and associate the correct probes file(s) with the programming file already programmed in the device.
++# puts "Closing hardware target..."
++Closing hardware target...
++# close_hw_target "localhost:3121/xilinx_tcf/Digilent/$target_serial"
++INFO: [Labtoolstcl 44-464] Closing hw_target localhost:3121/xilinx_tcf/Digilent/210308B09B70
++# puts "Programming completed successfully"
++Programming completed successfully
++# exit 0
++INFO: [Common 17-206] Exiting Vivado at Sun Nov  1 16:00:47 2026...
+diff --git a/vivado_25779.backup.jou b/vivado_25779.backup.jou
+deleted file mode 100644
+index c7d5cec..0000000
+--- a/vivado_25779.backup.jou
++++ /dev/null
+@@ -1,24 +0,0 @@
+-#-----------------------------------------------------------
+-# Vivado v2024.1 (64-bit)
+-# SW Build 5076996 on Wed May 22 18:36:09 MDT 2024
+-# IP Build 5075265 on Wed May 22 21:45:21 MDT 2024
+-# SharedData Build 5076995 on Wed May 22 18:29:18 MDT 2024
+-# Start of session at: Sat Jun  6 20:05:25 2026
+-# Process ID: 25779
+-# Current directory: /home/omowuyi/testing/hs_api
+-# Command line: vivado -mode batch -source /bitstreams/scripts/progbit.tcl -tclargs /bitstreams/sixteen_core_top_L6j.bit
+-# Log file: /home/omowuyi/testing/hs_api/vivado.log
+-# Journal file: /home/omowuyi/testing/hs_api/vivado.jou
+-# Running On        :crisdsc0.ucsd.edu
+-# Platform          :Rocky
+-# Operating System  :Rocky Linux release 8.10 (Green Obsidian)
+-# Processor Detail  :AMD EPYC 7452 32-Core Processor
+-# CPU Frequency     :2350.000 MHz
+-# CPU Physical cores:64
+-# CPU Logical cores :128
+-# Host memory       :1081498 MB
+-# Swap memory       :0 MB
+-# Total Virtual     :1081498 MB
+-# Available Virtual :1074745 MB
+-#-----------------------------------------------------------
+-source /bitstreams/scripts/progbit.tcl
+diff --git a/vivado_25779.backup.log b/vivado_25779.backup.log
+deleted file mode 100644
+index 67105ae..0000000
+--- a/vivado_25779.backup.log
++++ /dev/null
+@@ -1,161 +0,0 @@
+-#-----------------------------------------------------------
+-# Vivado v2024.1 (64-bit)
+-# SW Build 5076996 on Wed May 22 18:36:09 MDT 2024
+-# IP Build 5075265 on Wed May 22 21:45:21 MDT 2024
+-# SharedData Build 5076995 on Wed May 22 18:29:18 MDT 2024
+-# Start of session at: Sat Jun  6 20:05:25 2026
+-# Process ID: 25779
+-# Current directory: /home/omowuyi/testing/hs_api
+-# Command line: vivado -mode batch -source /bitstreams/scripts/progbit.tcl -tclargs /bitstreams/sixteen_core_top_L6j.bit
+-# Log file: /home/omowuyi/testing/hs_api/vivado.log
+-# Journal file: /home/omowuyi/testing/hs_api/vivado.jou
+-# Running On        :crisdsc0.ucsd.edu
+-# Platform          :Rocky
+-# Operating System  :Rocky Linux release 8.10 (Green Obsidian)
+-# Processor Detail  :AMD EPYC 7452 32-Core Processor
+-# CPU Frequency     :2350.000 MHz
+-# CPU Physical cores:64
+-# CPU Logical cores :128
+-# Host memory       :1081498 MB
+-# Swap memory       :0 MB
+-# Total Virtual     :1081498 MB
+-# Available Virtual :1074745 MB
+-#-----------------------------------------------------------
+-source /bitstreams/scripts/progbit.tcl
+-# if {$argc < 1 || $argc > 2} {
+-#     puts "Usage: $argv0 <bitfile_path> \[ltxfile_path\]"
+-#     puts "Example: $argv0 /path/to/file.bit /path/to/file.ltx"
+-#     exit 1
+-# }
+-# set bitfile [lindex $argv 0]
+-# set ltxfile [expr {$argc == 2 ? [lindex $argv 1] : ""}]
+-# if {![file exists $bitfile]} {
+-#     puts "Error: Bitfile '$bitfile' does not exist"
+-#     exit 1
+-# }
+-# if {$ltxfile ne "" && ![file exists $ltxfile]} {
+-#     puts "Error: LTX file '$ltxfile' does not exist"
+-#     exit 1
+-# }
+-# set hw_server_url "localhost:3121"
+-# set target_device "xcvu37p_0"
+-# set programming_freq 5000000
+-# set target_serial "210308B09B70"
+-# puts "Opening hardware manager..."
+-Opening hardware manager...
+-# if {[catch {open_hw_manager} err]} {
+-#     puts "Error: Failed to open hardware manager: $err"
+-#     exit 1
+-# }
+-open_hw_manager: Time (s): cpu = 00:00:08 ; elapsed = 00:00:07 . Memory (MB): peak = 1662.016 ; gain = 67.828 ; free physical = 1022437 ; free virtual = 1024615
+-# puts "Connecting to hardware server at $hw_server_url..."
+-Connecting to hardware server at localhost:3121...
+-# if {[catch {connect_hw_server -url $hw_server_url} err]} {
+-#     puts "Error: Failed to connect to hardware server: $err"
+-#     exit 1
+-# }
+-INFO: [Labtools 27-2285] Connecting to hw_server url TCP:localhost:3121
+-INFO: [Labtools 27-2222] Launching hw_server...
+-INFO: [Labtools 27-2221] Launch Output:
+-
+-****** Xilinx hw_server v2024.1
+-  **** Build date : May 22 2024 at 19:19:01
+-    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+-
+-
+-INFO: [Labtools 27-3415] Connecting to cs_server url TCP:localhost:0
+-INFO: [Labtools 27-3417] Launching cs_server...
+-INFO: [Labtools 27-2221] Launch Output:
+-Cannot send datagram packet to /0.0.0.255
+-OSError: [Errno 22] Invalid argument
+-  File "chipscopy/tcf/services/local/LocatorService.py", line 705, in __sendDatagramPacket
+-
+-
+-******** Xilinx cs_server v2024.1.0
+-  ****** Build date   : Apr 26 2024-18:40:49
+-    **** Build number : 2024.1.1714182049
+-      ** Copyright 2017-2022 Xilinx, Inc. All Rights Reserved.
+-      ** Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+-
+-
+-
+-# puts "Setting programming frequency to $programming_freq Hz..."
+-Setting programming frequency to 5000000 Hz...
+-# if {[catch {
+-#     set_property PARAM.FREQUENCY $programming_freq [get_hw_targets */xilinx_tcf/Digilent/$target_serial]
+-# } err]} {
+-#     puts "Error: Failed to set frequency: $err"
+-#     exit 1
+-# }
+-# puts "Opening hardware target..."
+-Opening hardware target...
+-# if {[catch {open_hw_target} err]} {
+-#     puts "Error: Failed to open hardware target: $err"
+-#     exit 1
+-# }
+-INFO: [Labtoolstcl 44-466] Opening hw_target localhost:3121/xilinx_tcf/Digilent/210308B09B70
+-# set device [lindex [get_hw_devices $target_device] 0]
+-# if {$device eq ""} {
+-#     puts "Error: Device $target_device not found"
+-#     exit 1
+-# }
+-# puts "Setting bitfile: [file tail $bitfile]"
+-Setting bitfile: sixteen_core_top_L6j.bit
+-# if {[catch {set_property PROGRAM.FILE $bitfile $device} err]} {
+-#     puts "Error: Failed to set bitfile: $err"
+-#     exit 1
+-# }
+-# if {$ltxfile ne ""} {
+-#     puts "Setting probes file: [file tail $ltxfile]"
+-#     if {[catch {set_property PROBES.FILE $ltxfile $device} err]} {
+-#         puts "Error: Failed to set probes file: $err"
+-#         exit 1
+-#     }
+-# } else {
+-#     puts "No probes file provided, skipping"
+-# }
+-No probes file provided, skipping
+-# current_hw_device $device
+-# refresh_hw_device $device
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 2 HBM core(s).
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 ILA core(s).
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 VIO core(s).
+-WARNING: [Labtools 27-1347] Unable to find Debug Probes file []. Please update hw_device property [PROBES.FILE]
+- Update of hw_probe objects, will be skipped.
+-WARNING: [Labtools 27-1974] Mismatch between the design programmed into the device xcvu37p_0 and the probes file(s) .
+-The device design has 1 ILA core(s) and 1 VIO core(s). 0 ILA core(s) and 0 VIO core(s) are matched in the probes file(s).
+-Resolution: 
+-1. Reprogram device with the correct programming file and associated probes file(s) OR
+-2. Goto device properties and associate the correct probes file(s) with the programming file already programmed in the device.
+-# puts "Programming Device $target_device with [file tail $bitfile]..."
+-Programming Device xcvu37p_0 with sixteen_core_top_L6j.bit...
+-# if {[catch {program_hw_devices $device} err]} {
+-#     puts "Error: Programming failed: $err"
+-#     exit 1
+-# }
+-INFO: [Labtools 27-3164] End of startup status: HIGH
+-program_hw_devices: Time (s): cpu = 00:00:53 ; elapsed = 00:00:49 . Memory (MB): peak = 1754.113 ; gain = 0.000 ; free physical = 1022175 ; free virtual = 1024472
+-# puts "Programming verification: startup status HIGH (DONE)"
+-Programming verification: startup status HIGH (DONE)
+-# puts "Waiting for device to stabilize..."
+-Waiting for device to stabilize...
+-# after 5000
+-# refresh_hw_device $device
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 2 HBM core(s).
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 ILA core(s).
+-INFO: [Labtools 27-2302] Device xcvu37p (JTAG device index = 0) is programmed with a design that has 1 VIO core(s).
+-WARNING: [Labtools 27-1347] Unable to find Debug Probes file []. Please update hw_device property [PROBES.FILE]
+- Update of hw_probe objects, will be skipped.
+-WARNING: [Labtools 27-1974] Mismatch between the design programmed into the device xcvu37p_0 and the probes file(s) .
+-The device design has 1 ILA core(s) and 1 VIO core(s). 0 ILA core(s) and 0 VIO core(s) are matched in the probes file(s).
+-Resolution: 
+-1. Reprogram device with the correct programming file and associated probes file(s) OR
+-2. Goto device properties and associate the correct probes file(s) with the programming file already programmed in the device.
+-# puts "Closing hardware target..."
+-Closing hardware target...
+-# close_hw_target "localhost:3121/xilinx_tcf/Digilent/$target_serial"
+-INFO: [Labtoolstcl 44-464] Closing hw_target localhost:3121/xilinx_tcf/Digilent/210308B09B70
+-# puts "Programming completed successfully"
+-Programming completed successfully
+-# exit 0
+-INFO: [Common 17-206] Exiting Vivado at Sat Jun  6 20:06:39 2026...

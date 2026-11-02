@@ -1,0 +1,522 @@
+import numpy as np
+import pickle
+import os
+import math
+import sys
+import warnings
+import logging
+import time
+import hs_bridge.wrapped_dmadump.dmadump as dmadump
+from hs_bridge.config import *
+
+def text2script(cmd_str):
+    """Converts a string of hex characters into the correct format to suppyl to the adxdma dump command.
+
+    Given a string of hex characters with the left most character containing the MSB create a string of pairs of hex characters representing bytes
+    with the leftmost byte contanining the LSB in the format expected by the adxdma_dmadump binary for the data argument.
+
+    Parameters
+    ----------
+    cmd_str : str
+        The string of hexidecimal characters to format. The first character represents the hex character containing the MSB
+
+    Returns
+    -------
+    script_txt : str
+        The formated string of bytes
+    """
+    cmd = cmd_str
+    script_txt = ''
+    while cmd:
+        script_txt += '0x' + cmd[-2:] + ' '
+        cmd = cmd[0:-2]
+    return script_txt
+
+
+class fpga_compiler:
+    """Produces the needed adxdma dump scripts of a given network to program HBM
+
+    Attributes
+    ----------
+    input : dict
+        The inputs to the network for each timestep. Key, timestep value, list of axons
+    axon_ptrs : numpy array
+        Array of tuples pointing to the rows containing the synapses for the corresponding Axon.
+    Each tuple is (start row, end row).
+    neuron_ptrs : numpy array
+        Array of tuples pointing to the rows containing the synapses for the corresponding Axon.
+    Each tuple is (start row, end row).
+    synapses : list
+        List of tuples corresponding to synapses. Each tuple is (oncore/offcore bit, synapse address (row index of destination neuron pointer in HBM calculated as floor(destination neuron index / number of neuron groups)), weight)
+    HBM_WRITE_CMD : str
+
+    HBM_OP_RW  : str
+        OP code to read/write to hbm vie PCie
+    NRN_BASE_ADDR : int
+        Starting address of neuron pointers in HBM
+    SYN_BASE_ADDR : int
+        Starting address of synapses in HBM
+    PTR_ADDR_BITS : int
+        Number of bits used to represent pointer starting adderess
+    PTR_LEN_BITS :
+        Number of bits used to represent the number of rows of synapses a pointer corresponds to
+    SYN_OP_BITS :
+        Number of bits used to represent synapse opcode
+    SYN_ADDR_BITS :
+        Number of bits used to represent synapse address
+    SYN_WEIGHT_BITS :
+        Number of bits used to represent synapse weight
+
+    """
+
+
+    # OP code to read/write to hbm vie PCie
+    #HBM_OP_RW = '02' + 28 * '00'
+
+    #TODO: these values should be in the config.py file
+    #PTR_ADDR_BITS = 23  # HBM row address
+    #PTR_LEN_BITS = 9  # (8 connections/row x 2^9 rows = 2^12 = 4K connections max)
+    #AXN_BASE_ADDR = 0  # axon pointer start address
+    ##NRN_BASE_ADDR = 2 ** 14  #commented out, this value lives in config.py. neuron pointer start address (2^17 axons / 8 axon pointers/row = 2^14 rows max)
+    #SYN_BASE_ADDR = 2 ** 15  # (2^17 neurons / 8 neuron pointers/row = 2^14 rows max -> 2^14+2^14=2^15)
+
+    #SYN_ADDR_BITS = 13  # each synapse: [31:29]=OpCode  [28:16]=address, [15:0]=weight (1 sign + 15 value, fixed-point)
+    #SYN_WEIGHT_BITS = 16
+    #SYN_OP_BITS = 3
+
+    #HBM_WRITE_CMD = 'sudo adxdma_dmadump wb 0 0 '
+
+    #WRITE = '01' + 63 * '00'
+
+    def __init__(self, data, N_neurons,  outputs, coreID = 0):
+        '''
+        Creates the FPGA Compiler object. Populates spike packets in synapses.
+
+        Paramaters
+        ----------
+        data: list
+            Takes the following format: [0]=input data, [1]=axon pointers, [2]=neuron pointers, [3]=synapses
+        N_neurons : int
+            Number of neurons in network
+        CoreID : int
+            Index of core in FPGA to write to
+        '''
+        coreBits = np.binary_repr(coreID,5)+3*'0'#5 bits for coreID
+        coreByte = '{:0{width}x}'.format(int(coreBits, 2), width=2)
+        self.HBM_OP_RW = '02' + coreByte + 27 * '00'
+        self.HBM_OP_RW_LIST = [2,int(coreBits,2)] + [0]*27
+        #self.input = data[0]
+        self.axon_ptrs = data[0]
+        self.neuron_ptrs = data[1]
+        self.synapses = data[2]
+
+        n = 0
+        errors = 0
+        #This works because of how python handles references but it would be much clearer
+        #to directly work with self.neuron_ptrs and self.synapses
+        #Find space to insert spike packets and insert them in the numpy array representing synapses
+        #only assign spike entries in HBM for neurons in the outputs list
+        #for row in range(len(data[1])):
+            #for col in range(len(data[1][row]))
+        rowLength = len(data[1][0])
+        for neuronIdx in outputs:
+            row = int(np.floor(neuronIdx / rowLength))
+            col = neuronIdx % rowLength
+            start = data[1][row][col][0]
+            end = data[1][row][col][1] + 1
+            finished = False
+            for r in data[2][start:end]:
+                for i in range(len(r)):
+                    if r[i] == (0, 0, 0) and n <= len(outputs):
+                        r[i] = (1, neuronIdx)
+                        #n += 1
+                        finished = True
+                        break
+
+                if finished:
+                    break
+            if not finished:
+                if n == len(outputs):
+                    pass
+                else:
+                    
+                    if n > N_neurons:
+                        logging.info('neuron pointer index is greater than specified number of internal neurons, a spike entry will not be assigned to remaining neuron pointer')
+                    else:
+
+                         errors+=1
+                         logging.error('neuron pointer index: '+ str(n) +' could not be assigned a spike entry')
+
+
+
+        logging.info('spike entry assignment errors: ', errors)
+
+
+
+
+    def create_axon_ptrs(self, simDump = False, syn_64bit = False):
+        '''
+        Creates the necessary adxdma_dump commands to program the axon pointers into HBM
+
+        Returns
+        -------
+        script : str
+            The bash commands to run to program the axon pointers in HBM
+        '''
+
+        if simDump:
+            dump = []
+        axn_ptrs = np.fliplr(self.axon_ptrs)
+        batchCmd = []
+        for r, d in enumerate(axn_ptrs):
+
+            oldCmd = ''
+            cmd = []
+            for p in d:
+                # 64-bit entries halve the entries per HBM row, so each logical
+                # synapse row becomes two HBM rows and offsets double.
+                _s = (p[0] * 2) if syn_64bit else p[0]
+                _l = (2 * (p[1] - p[0]) + 1) if syn_64bit else (p[1] - p[0])
+                binAddr = np.binary_repr(_l, PTR_LEN_BITS) + np.binary_repr(_s + SYN_BASE_ADDR, PTR_ADDR_BITS)
+                oldCmd += '{:0{width}x}'.format(int(binAddr,2), width=8)
+                cmd = cmd + [int(binAddr[:8],2),int(binAddr[8:16],2),int(binAddr[16:24],2),int(binAddr[24:],2)]
+
+            # append HBM write opcode and WRITE command
+            oldCmd = self.HBM_OP_RW + '{:0{width}x}'.format(0x800000 + r, width=6) + oldCmd
+            rowAddress = '1'+np.binary_repr(r+AXN_BASE_ADDR,23)
+            cmd = self.HBM_OP_RW_LIST + [int(rowAddress[:8],2),int(rowAddress[8:16],2),int(rowAddress[16:],2)]  + cmd
+            oldCmd = self.txt2script(oldCmd)
+            cmd.reverse()
+            if simDump:
+                dumpCmd = ['{:0{width}x}'.format(i, width=2) for i in cmd]
+                dumpCmd.reverse()
+                dumpCmd = ''.join(dumpCmd)
+                dump.append(dumpCmd)
+            else:
+                batchCmd = batchCmd + cmd
+                #print(cmd)
+        if simDump:
+            return dump
+        else:
+            #print(np.array(batchCmd))
+            exitCode = dmadump.dma_dump_write(np.array(batchCmd), len(batchCmd), 1, 0, 0, 0, dmadump.DmaMethodNormal)
+            
+
+    def txt2script(self, cmd_str):
+        """Converts a string of hex characters into the correct format to suppyl to the adxdma dump command.
+
+        Given a string of hex characters with the left most character containing the MSB create a string of pairs of hex characters representing bytes
+        with the leftmost byte contanining the LSB in the format expected by the adxdma_dmadump binary for the data argument.
+
+        Parameters
+        ----------
+        cmd_str : str
+            The string of hexidecimal characters to format. The first character represents the hex character containing the MSB
+
+        Returns
+        -------
+        script_txt : str
+            The formated string of bytes
+        """
+        cmd = cmd_str
+        script_txt = ''
+        while cmd:
+            script_txt += '0x' + cmd[-2:] + ' '
+            cmd = cmd[0:-2]
+        return script_txt
+
+    def create_neuron_ptrs(self, simDump = False, syn_64bit = False):
+        '''
+        Creates the necessary data arguments to pass to the adxdma_dump commands to program the neuron pointers into HBM.
+        Data arguments for multiple adxdma_dump commands are seperated by new line characters
+
+        Returns
+        -------
+        script : str
+            The data arguments to provide to a series of adxdma_dump commands. Data arguments for successive adxdma_dump commands
+        are seperated by newline characters
+        '''
+        if simDump:
+            dump = []
+        nrn_ptrs = np.fliplr(self.neuron_ptrs)
+        batchCmd = []
+        for r, d in enumerate(nrn_ptrs):
+            oldCmd = ''
+            cmd = []
+            for p in d:
+
+                _s = (p[0] * 2) if syn_64bit else p[0]
+                _l = (2 * (p[1] - p[0]) + 1) if syn_64bit else (p[1] - p[0])
+                binCmd = np.binary_repr(_l, PTR_LEN_BITS) + np.binary_repr(_s + SYN_BASE_ADDR, PTR_ADDR_BITS)
+                cmd = cmd + [int(binCmd[:8],2),int(binCmd[8:16],2),int(binCmd[16:24],2),int(binCmd[24:],2)]
+                oldCmd += '{:0{width}x}'.format(int(binCmd, 2), width=8)
+
+
+            # append HBM write opcode and address
+            oldCmd = self.HBM_OP_RW + '{:0{width}x}'.format(0x800000 + NRN_BASE_ADDR + r, width=6) + oldCmd
+            rowAddress = '1'+np.binary_repr(r+NRN_BASE_ADDR,23)
+            cmd = self.HBM_OP_RW_LIST + [int(rowAddress[:8],2),int(rowAddress[8:16],2),int(rowAddress[16:],2)]  + cmd
+            oldCmd = self.txt2script(oldCmd) + '\n'
+            cmd.reverse()
+            if simDump:
+                dumpCmd = ['{:0{width}x}'.format(i, width=2) for i in cmd]
+                dumpCmd.reverse()
+                dumpCmd = ''.join(dumpCmd)
+                dump.append(dumpCmd)
+            else:
+                batchCmd = batchCmd + cmd
+                #print(cmd)
+        #print(np.array(batchCmd))
+        if simDump:
+            return dump
+        else:
+            dmadump.dma_dump_write(np.array(batchCmd), len(batchCmd), 1, 0, 0, 0, dmadump.DmaMethodNormal) 
+            #return script
+
+    def create_synapses(self, simDump = False, syn_64bit = False):
+        '''
+        Creates the necessary adxdma_dump commands to program the synapses into HBM
+
+        Returns
+        -------
+        script : str
+            The bash commands to run to program the synapses in HBM
+        '''
+        #breakpoint()
+        if simDump:
+            dump = []
+        weights = self.synapses
+
+        if syn_64bit:
+            return self._create_synapses_64(simDump)
+        #script = ''
+        n = 0
+        #batchCmd = []
+        bigCmdList = []
+        for r, d in enumerate(weights):
+            oldCmd = ''
+            cmd = []
+            for w in d:
+                if w[0] == 0:
+                    # [31] = 0 for internal connections and 1 for external connections, [30:29] = unused for single core
+                    # TODO: how do I know if a given synapse is an internal or external connection?
+                    binCmd = np.binary_repr( 0, SYN_OP_BITS) + np.binary_repr(int(w[1]), SYN_ADDR_BITS) + np.binary_repr(int(w[2]),SYN_WEIGHT_BITS)
+                    oldCmd += '{:0{width}x}'.format(int(binCmd, 2),width=8)
+                    cmd = cmd + [int(binCmd[:8],2),int(binCmd[8:16],2),int(binCmd[16:24],2),int(binCmd[24:],2)]
+                #TODO: looks like this format is out of date, it should be the same as the above format. It may not be hyper critical
+                elif w[0] == 1:
+                    #spike = str(w[0]) + 15 * '0'
+                    spike = 16 * '0'
+                    print(w[1])
+                    #addr = np.binary_repr(w[1], SYN_ADDR_BITS)
+                    #cmd += '{:0{width}x}'.format(int(spike + addr, 2), width=8)
+                    binSpike = np.binary_repr( 4, SYN_OP_BITS) + 12*'0' + np.binary_repr(w[1],17)
+                    oldCmd += '{:0{width}x}'.format(int(binSpike, 2),width=8)
+                    cmd = cmd + [int(binSpike[:8],2),int(binSpike[8:16],2),int(binSpike[16:24],2),int(binSpike[24:],2)]
+
+
+
+            # append HBM write opcode and address
+            oldCmd = self.HBM_OP_RW + '{:0{width}x}'.format(0x800000 + SYN_BASE_ADDR + r, width=6) + oldCmd
+            rowAddress = '1'+np.binary_repr(r+SYN_BASE_ADDR,23)
+            cmd = self.HBM_OP_RW_LIST + [int(rowAddress[:8],2),int(rowAddress[8:16],2),int(rowAddress[16:],2)]  + cmd
+            oldCmd = self.txt2script(oldCmd) + '\n'
+            cmd = np.flip(np.array(cmd,dtype=np.uint64))
+            #cmd.reverse()
+            #
+            if simDump:
+                dumpCmd = ['{:0{width}x}'.format(i, width=2) for i in cmd]
+                dumpCmd.reverse()
+                dumpCmd = ''.join(dumpCmd)
+                dump.append(dumpCmd)
+            else:
+                bigCmdList.append(cmd)
+                #print(cmd)
+            #time.sleep(.005)
+            #
+            n = n + 1
+
+        # write to text file
+        if simDump:
+            return dump
+        else:
+            split = np.concatenate(bigCmdList)
+            n = 10
+
+ 
+            loopBreak = False
+            count = 0
+            while loopBreak == False:
+                count = count+1
+                #print('begin: '+str(count))
+                #breakpoint()
+                try:
+                    element = split[:n*64]
+                    split = split[n*64:]
+                except:
+                    element = split
+                    loopBreak = True
+                if element.size == 0:
+                    break
+                #print(element)
+                exitCode = dmadump.dma_dump_write(element, len(element), 1, 0, 0, 0, dmadump.DmaMethodNormal)
+                if exitCode != 0:
+                    pass
+                            #time.sleep(.4)
+                #print('end: '+str(count))
+        
+
+
+
+    def _syn64_entry(self, w):
+        """One 64-bit synapse entry as a 64-character bit string.
+
+        {op[2:0], dest[12:0], weight[15:0], delay[5:0], syn_type[3:0],
+         stdp_tag[3:0], src[17:0]}   -- matches internal_events_processor.v
+
+        Accepts (op, dest, weight), (op, dest, weight, delay, src) or (op, dest, weight, delay, src, rule):
+        rule = plasticity rule slot 1..15 written to stdp_tag (0 or absent = static synapse).
+        """
+        # A 5-tuple carries its own delay; a 3-tuple falls back to the
+        # network-wide default, which is how delay is specified until the
+        # connectome grows a per-synapse field.
+        # FIX W: a spike entry is op=4 with the address in the low 17 bits,
+        # exactly as the 32-bit path encodes it.  Dropping these was making
+        # affected neurons unable to report spikes at all in 64-bit mode.
+        if w[0] == 1:
+            return (np.binary_repr(4, SYN_OP_BITS)
+                    + 44 * '0'
+                    + np.binary_repr(int(w[1]) & 0x1FFFF, 17))
+        if w[0] != 0:
+            raise ValueError("unhandled synapse opcode %r" % (w[0],))
+        delay = int(w[3]) if len(w) > 3 else getattr(self, 'syn_delay', 0)
+        src   = int(w[4]) if len(w) > 4 else 0
+        tag   = int(w[5]) if len(w) > 5 else 0
+        if not 0 <= tag <= 15:
+            raise ValueError("plasticity rule slot %d outside 0-15" % tag)
+        if not 0 <= delay <= 63:
+            raise ValueError("synapse delay %d outside 0-63" % delay)
+        return (np.binary_repr(0, SYN_OP_BITS)
+                + np.binary_repr(int(w[1]), SYN_ADDR_BITS)
+                + np.binary_repr(int(w[2]), SYN_WEIGHT_BITS)
+                + np.binary_repr(delay, 6)
+                + np.binary_repr(0, 4)          # syn_type, reserved
+                + np.binary_repr(tag, 4)        # stdp_tag: plasticity rule slot, 0 = static
+                + np.binary_repr(src, 18))
+
+    def _create_synapses_64(self, simDump = False):
+        """64-bit emit.  Each logical row of 8 entries becomes TWO HBM rows of
+        4 entries, written at SYN_BASE_ADDR + 2r and + 2r + 1, preserving
+        entry order.  Pointer offsets are doubled to match."""
+        dump = [] if simDump else None
+        bigCmdList = []
+        for r, d in enumerate(self.synapses):
+            # FIX W: was `if w[0] == 0`, which dropped spike entries and slid
+            # everything after them into the wrong slot.  Encode every entry
+            # and keep its position.
+            entries = [self._syn64_entry(w) for w in d]
+            while len(entries) < 8:
+                entries.append(np.binary_repr(0, 64))
+            for half in (0, 1):
+                cmd = []
+                for b in entries[half * 4:(half + 1) * 4]:
+                    cmd += [int(b[i:i + 8], 2) for i in range(0, 64, 8)]
+                # Measured: group quad gq reads HBM row 3-gq, so slot
+                # quad q must be written at row 3-q.  Reversal applies
+                # within each 16-group unit (2 logical rows = 4 HBM rows).
+                _unit = r // 2
+                _within = 2 * (r % 2) + half
+                _hbm_row_reversed = 4 * _unit + (3 - _within)
+                rowAddress = '1' + np.binary_repr(SYN_BASE_ADDR + _hbm_row_reversed, 23)
+                cmd = (self.HBM_OP_RW_LIST
+                       + [int(rowAddress[:8], 2), int(rowAddress[8:16], 2),
+                          int(rowAddress[16:], 2)] + cmd)
+                cmd = np.flip(np.array(cmd, dtype=np.uint64))
+                if simDump:
+                    h = ['{:0{width}x}'.format(i, width=2) for i in cmd]
+                    h.reverse()
+                    dump.append(''.join(h))
+                else:
+                    bigCmdList.append(cmd)
+        if simDump:
+            return dump
+        split = np.concatenate(bigCmdList)
+        while split.size:
+            element = split[:640]
+            split = split[640:]
+            dmadump.dma_dump_write(element, len(element), 1, 0, 0, 0,
+                                   dmadump.DmaMethodNormal)
+
+    @staticmethod
+    def _parse_write(h):
+        """CMD 2 write packet (simDump hex, most significant byte first) -> (row, 256-bit value)."""
+        b = bytes.fromhex(h)
+        addr = int.from_bytes(b[29:32], 'big')
+        if b[0] != 2 or not (addr >> 23) & 1:
+            raise ValueError("not a CMD 2 write packet")
+        return addr & 0x7FFFFF, int.from_bytes(b[32:64], 'big')
+
+    def _write_packet(self, row, value):
+        a = '1' + np.binary_repr(row, 23)
+        cmd = self.HBM_OP_RW_LIST + [int(a[:8], 2), int(a[8:16], 2), int(a[16:], 2)] + list(value.to_bytes(32, 'big'))
+        return np.flip(np.array(cmd, dtype=np.uint64))
+
+    def plasticity_rows(self, n_axons, n_neurons, free_row=None):
+        """Plasticity layout for this core (64-bit synapses only).  Returns (packets, cfg_pairs, image, new_rows):
+        CMD 2 write packets for the extra rows, the base-register pairs for opcode 19, the compiled image as written
+        (src filled on plastic entries; those synapse rows are included in the packets), and the extra rows."""
+        from hs_bridge.FPGA_Execution import plasticity as PL
+        image = {}
+        for h in (self.create_axon_ptrs(simDump=True, syn_64bit=True) + self.create_neuron_ptrs(simDump=True, syn_64bit=True)
+                  + self._create_synapses_64(simDump=True)):
+            r, v = self._parse_write(h if isinstance(h, str) else h[0])
+            image[r] = v
+        before = dict(image)
+        if free_row is None:
+            free_row = max(image) + 1 if image else 0
+        new, pairs = PL.layout(image, n_axons, n_neurons, free_row)
+        rows = dict(new)
+        rows.update({r: v for r, v in image.items() if before.get(r) != v})   # synapse rows whose src was filled
+        return [self._write_packet(r, v) for r, v in sorted(rows.items())], pairs, image, new
+
+    def create_script(self, fname, simDump = False, syn_64bit = False,
+                      syn_delay = 0):
+        # Recorded before any emit so _syn64_entry can see it.  Delay only
+        # has meaning in the 64-bit format; the 32-bit entry has no field
+        # for it, so a nonzero delay there is a caller error.
+        if syn_delay and not syn_64bit:
+            raise ValueError("syn_delay requires syn_64bit=True -- the "
+                             "32-bit synapse entry has no delay field")
+        if not 0 <= syn_delay <= 63:
+            raise ValueError("syn_delay %d outside 0-63" % syn_delay)
+        self.syn_delay = syn_delay
+        """Generates the bash file to program HBM for the current network
+
+        Generates the bash file needed to program the axon pointers, neuron pointers, and synapses into hbm
+
+        Parameters
+        ----------
+        fname : int
+            The filename to write the script to
+        """
+        axon_ptrs = self.create_axon_ptrs(simDump, syn_64bit)
+        neuron_ptrs = self.create_neuron_ptrs(simDump, syn_64bit)
+        synapses = self.create_synapses(simDump, syn_64bit)
+
+        if simDump:
+            return axon_ptrs, neuron_ptrs, synapses
+
+def main():
+    with open('test' + '.pkl', 'rb') as f:
+        data = pickle.load(f)
+
+    f = fpga_compiler(data, 6271)
+
+    f.create_script('test_config')
+    #TODO: these values should not be hardcoded
+    f.create_input_script(num_timesteps=0,n_inputs=1,filename='test_input')
+    #print(f.create_neuron_ptrs().split('\n'))
+
+
+if __name__ == '__main__':
+    main()

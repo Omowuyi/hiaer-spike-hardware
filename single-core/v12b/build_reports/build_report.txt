@@ -1,0 +1,54 @@
+==== build_v12b trial Sat Oct 31 07:33:23 PDT 2026
+SYNTH: synth_design Complete!
+SLICE CELLS: mode 15 30720, mode 12 0
+nets with MARK_DEBUG: 5233
+core_wrapper instances with taps: 16
+  genblk3[0].my_core
+  genblk3[10].my_core
+  genblk3[11].my_core
+  genblk3[12].my_core
+  genblk3[13].my_core
+  genblk3[14].my_core
+  genblk3[15].my_core
+  genblk3[1].my_core
+  genblk3[2].my_core
+  genblk3[3].my_core
+  genblk3[4].my_core
+  genblk3[5].my_core
+  genblk3[6].my_core
+  genblk3[7].my_core
+  genblk3[8].my_core
+  genblk3[9].my_core
+core 1 = genblk3[1].my_core
+  probe inst/hbmp/dbg_tx_state                     4 bits
+  probe inst/hbmp/dbg_rx_state                     4 bits
+  probe inst/hbmp/dbg_tx_ptr_ctr                  23 bits
+  probe inst/hbmp/dbg_rx_ptr_ctr                  23 bits
+  probe inst/hbmp/dbg_wait_clks_cnt                8 bits
+  probe inst/hbmp/dbg_wait_clks_done_cnt           5 bits
+  probe inst/hbmp/dbg_phase                        6 bits
+  probe inst/hbmp/dbg_in                           3 bits
+  probe inst/hbmp/dbg_fifo                         4 bits
+  probe inst/hbmp/dbg_axi                          5 bits
+  probe inst/iep/dbg_iep_state                     4 bits
+  probe inst/iep/dbg_iep_timeout                  11 bits
+  probe inst/iep/dbg_iep_flags                     4 bits
+  probe inst/eep/dbg_eep_state                     3 bits
+  probe inst/eep/dbg_eep_flags                     2 bits
+  probe inst/ptf_fifo_controller/dbg_pfc_wren      1 bits
+  probe inst/ci/dbg_ci_rx_state                    4 bits
+  probe inst/ci/dbg_ci_tx_state                    4 bits
+  probe inst/ci/dbg_ci_flags                       2 bits
+  probe inst/dbg_bram_spiked                      16 bits
+  probe inst/dbg_uram_spiked                      16 bits
+  probe inst/dbg_p2done                            2 bits
+all 22 taps found on core 1, 154 bits
+ILA clock net: genblk3[1].my_core/aclk450
+ILA u_ila_c1: 22 probes connected
+ILA cells after opt_design: 7157
+POST-PLACEMENT WNS: 0.302   WHS: -1.110   (estimates before routing)
+TRIAL_DONE: placed checkpoint /data/omowuyi/multicore_noc_exp_psc/v12b_build/placed.dcp; reports place_util_slr.rpt, place_util.rpt, place_timing.rpt
+==== build_v12b finish Sat Oct 31 13:52:23 PDT 2026
+WNS: 0.015   WHS: 0.000
+TIMING MET
+DONE: /data/omowuyi/multicore_noc_exp_psc/v12b_build/sixteen_core_noc_v12b_ila.bit and .ltx

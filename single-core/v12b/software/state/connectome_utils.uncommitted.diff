@@ -1,0 +1,56 @@
+diff --git a/connectome_utils/__pycache__/connectome.cpython-310.pyc b/connectome_utils/__pycache__/connectome.cpython-310.pyc
+index 64388ad..307b47a 100644
+Binary files a/connectome_utils/__pycache__/connectome.cpython-310.pyc and b/connectome_utils/__pycache__/connectome.cpython-310.pyc differ
+diff --git a/connectome_utils/connectome.py b/connectome_utils/connectome.py
+index a694f11..8e2a5b3 100644
+--- a/connectome_utils/connectome.py
++++ b/connectome_utils/connectome.py
+@@ -6,10 +6,11 @@ from jaal import Jaal
+ import pandas as pd
+ 
+ class synapse:
+-    def __init__(self, presynapticNeuron, postsynapticNeuron, weight):
++    def __init__(self, presynapticNeuron, postsynapticNeuron, weight, rule=0):
+         self.presynapticNeuron = presynapticNeuron
+         self.postsynapticNeuron = postsynapticNeuron
+         self.weight = weight
++        self.rule = int(rule)          # plasticity rule slot 1..15, 0 = static
+         self.synapseType = None #is the synapse within core (homogeneous) or between core (heterogeneous)
+         self.colIndex = None
+         self.rowIndex = None
+@@ -123,9 +124,9 @@ class neuron:
+          return self.__class__.__name__ < other.__class__.__name__
+ 
+ 
+-    def addSynapse(self, postsynapticNeuron, weight, delayed=False):
++    def addSynapse(self, postsynapticNeuron, weight, delayed=False, rule=0):
+         #append synapse to network
+-        newSynapse = synapse(self, postsynapticNeuron, weight) #create synapse object
++        newSynapse = synapse(self, postsynapticNeuron, weight, rule) #create synapse object
+         self.synapses.append(newSynapse) #add to synapse list
+ 
+     def set_hbmIdx(self,idx):
+@@ -501,8 +502,22 @@ class connectome:
+ 
+     def apply_partition(self, membership): #apply a partition to the network
+         mergedNeurons = self.get_merged_neurons()
++        #membership may be keyed by neuron/axon NAME ({neuron_key: core}, as CRI_network and
++        #hs_bridge partition() document) or by global index (hs_bridge's generated maps).
++        #If every key reads both ways and the two placements differ, refuse to guess.
++        by_name = all(k in self.connectomeDict for k in membership)
++        by_index = all(k in mergedNeurons for k in membership)
++        if not (by_name or by_index):
++            bad = [k for k in membership if k not in self.connectomeDict and k not in mergedNeurons]
++            raise KeyError("membership keys are neither neuron/axon names nor global indices: %r" % bad[:8])
++        if by_name and by_index and any(self.connectomeDict[k] is not mergedNeurons[k] and
++                                        membership[k] != membership.get(mergedNeurons[k].get_user_key(), membership[k])
++                                        for k in membership):
++            raise ValueError("membership keys are ambiguous (valid both as names and as global "
++                             "indices, with different placements); key the map by name only")
+         for key in membership.keys():
+-            mergedNeurons[key].set_core(membership[key]) #set core designation
++            obj = self.connectomeDict[key] if by_name else mergedNeurons[key]
++            obj.set_core(membership[key]) #set core designation
+         dictkeys = list(self.connectomeDict.keys()) #cast to list since we'll be modifying the dict
+         for neuronKey in dictkeys:
+             self.connectomeDict[neuronKey].set_synapseTypes() #update synapses and instantiate any relay neurons if needed

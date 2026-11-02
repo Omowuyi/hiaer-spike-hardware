@@ -1,0 +1,62 @@
+#+title: Format
+* PCIe Command specifications
+** Write Network Parameters
+| Bits    |       511:504 | 503:72 |        71:70 |     69:34 |             33:17 |             16:0 |
+| Content | Command: 0x04 |  zeros | Neuron Model | Threshold | Number of Outputs | Number of Inputs |
+** Send Input
+*** Old Format
+**** Initial Command
+| Bits    | 511:505 | 504 | 510:0 |
+| Content |   zeros |   1 | zeros |
+**** Subsiquent Data Commands
+| Bits    |                         511:0    |
+| Content | One Hot Encoding of Active Axons |
+*** New Format
+**** Initial Command
+| Bits    | 511:505 | 504 | 510:0 |
+| Content |   zeros |   1 | zeros |
+**** Subsiquent Data Commands
+| Bits    | 511:504 | 503:499 | 498:256 |                            255:0 |
+| Content |    0x00 |  coreID |   zeros | One Hot Encoding of Active Axons |
+** Request Read From HBM
+| Bits    | 511:504 | 503:280 | 279 |     278:256 | 255:0 |
+| Content |    0x02 |   zeros |   0 | Row Address | zeros |
+** Flush Read From HBM
+| Bits    |  8:0 |
+| content | 0x04 |
+*** Format of the Read from HBM is as follows
+| Bits    | 511:496 | 495:256 |  255:0 |
+| content |    data |   zeros | 0xBBBB |
+** Write HBM
+| Bits    | 511:504 | 503:280 | 279 |     278:256 | 255:0 |
+| Content |    0x02 |   Zeros |   1 | Row Address |  Data |
+** Request Read from URAM
+| Bits    | 511:504 | 53 |                 52:49 |              48:36 |  35:0 |
+| Content |    0x03 |  0 | Neuron Column Address | Neuron Row Address | zeros |
+** Flush Read From URAM
+| Bits    |  8:0 |
+| Content | 0x04 |
+*** Format of the read flushed from URAM is as follows
+| Bits    | 511:496 | 495:53 |         52:49 |      48:36 |               35:0 |
+| Content |  0xCCCC |  zeros | neuron column | neuron row | membrane Potential |
+** Execute Time Step
+| Bits    | 511:504 | 503:0 |
+| Content |    0x01 | zeros |
+
+** Outcoming Spike formats
+| Bits    |   511:480 |                      479:32 |                  31:0 |
+| Content | EEEE EEEE | 14 Individual Spike Packets | execution run counter |
+*** Individual Spike Packet Format
+| Bits    |            31:24 |                               23 | 22:17 |               16:0 |
+| Content | execRun_ctr[7:0] | 1 if valid or 0 if invalid       |  6'd0 | 17'b Spike Address |
+
+* HBM specifications
+** Axon and Neuron pointers
+| Bits    |          31:23 |            22:0 |
+| Content | Pointer Length | Pointer Address |
+** Synapse Format
+| Bits    |  31:29 |   28:16 |   15:0 |
+| Content | Opcode | Address | Weight |
+** Spike Format
+| Bits    | 31:29 | 28:17 |    16:0 |
+| Content |   100 | zeros | Address |

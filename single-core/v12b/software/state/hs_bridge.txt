@@ -1,0 +1,87 @@
+repository: /home/omowuyi/testing/hs_bridge
+branch: v3_19bit_wip
+HEAD: a077403799ca03bb797a5c26bb8aca14c4514a10
+remote: origin	git@github.com:Integrated-Systems-Neuroengineering/hs_bridge.git (fetch)
+remote: origin	git@github.com:Integrated-Systems-Neuroengineering/hs_bridge.git (push)
+--- status
+ M hs_bridge/FPGA_Execution/fpga_compiler.py
+ M hs_bridge/FPGA_Execution/fpga_controller.py
+ M hs_bridge/compile_network.py
+ M hs_bridge/network.py
+?? .claude/
+?? .python-version
+?? h
+?? "h_spikes and readSelect\""
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.bak_1777791185
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.bak_pre_bypass
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_64bit
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_delaycheck
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_fixw
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_plasticity
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_plasticity_api
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_roworder
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_slots
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_slotwarn
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.before_syndelay
+?? hs_bridge/FPGA_Execution/fpga_compiler.py.pre_bypass
+?? hs_bridge/FPGA_Execution/fpga_compiler_2.py
+?? hs_bridge/FPGA_Execution/fpga_controller.py.bak
+?? hs_bridge/FPGA_Execution/fpga_controller.py.bak_1777865350
+?? hs_bridge/FPGA_Execution/fpga_controller.py.bak_pre_stdp
+?? hs_bridge/FPGA_Execution/fpga_controller.py.bak_prelock
+?? hs_bridge/FPGA_Execution/fpga_controller.py.bak_spike_fix
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_19bit
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_bpfix
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_coreid
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_coreidfix
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_r4
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_rowb
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_softreset
+?? hs_bridge/FPGA_Execution/fpga_controller.py.before_swfix
+?? hs_bridge/FPGA_Execution/plasticity.py
+?? hs_bridge/compile_network.py.bak
+?? hs_bridge/compile_network.py.before_percore_part
+?? hs_bridge/compile_network.py.before_plasticity_api
+?? hs_bridge/network.py.bak_prelock
+?? hs_bridge/network.py.before_flushfix
+?? hs_bridge/network.py.before_percore_rt
+?? hs_bridge/network.py.before_plasticity
+?? hs_bridge/network.py.before_r4
+?? hs_bridge/network.py.before_softreset
+?? hs_bridge/network.py.before_syn64bit
+?? hs_bridge/network.py.before_syndelay
+?? hs_bridge/vivado.jou
+?? hs_bridge/vivado.log
+?? hs_bridge/vivado_498596.backup.jou
+?? hs_bridge/vivado_498596.backup.log
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.cpp.bak_bypass
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.cpp.bak_drain
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.cpp.pre_bypass
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.h.bak_bypass
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.h.bak_drain
+?? hs_bridge/wrapped_dmadump/adxdma_dmadump.h.pre_bypass
+?? hs_bridge/wrapped_dmadump/build/
+?? hs_bridge/wrapped_dmadump/cmdline.cpp.bak_bypass
+?? hs_bridge/wrapped_dmadump/cmdline.cpp.bak_drain
+?? hs_bridge/wrapped_dmadump/cmdline.cpp.pre_bypass
+?? hs_bridge/wrapped_dmadump/cmdline.h.bak_bypass
+?? hs_bridge/wrapped_dmadump/cmdline.h.bak_drain
+?? hs_bridge/wrapped_dmadump/cmdline.h.pre_bypass
+?? hs_bridge/wrapped_dmadump/dmadump.cpython-310-x86_64-linux-gnu.so
+?? hs_bridge/wrapped_dmadump/dmadump.pyx.bak2
+?? hs_bridge/wrapped_dmadump/dmadump.pyx.bak_1777791266
+?? hs_bridge/wrapped_dmadump/dmadump.pyx.bak_bypass
+?? hs_bridge/wrapped_dmadump/dmadump.pyx.bak_drain
+?? hs_bridge/wrapped_dmadump/dmadump.pyx.pre_bypass
+?? vivado.jou
+?? vivado.log
+?? vivado_2843613.backup.jou
+?? vivado_2843613.backup.log
+?? vivado_29171.backup.jou
+?? vivado_29171.backup.log
+?? vivado_298835.backup.jou
+?? vivado_298835.backup.log
+?? vivado_3892899.backup.jou
+?? vivado_3892899.backup.log
+?? vivado_540982.backup.jou
+?? vivado_540982.backup.log

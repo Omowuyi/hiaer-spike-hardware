@@ -1,0 +1,11 @@
+* ISN CRI Project
+
+This repository contains code to simulate the FPGA implementation for the NSF CRI Project.
+
+* Installation
+** Metis
+Inorder for network partitioning to work correctly it is important you set the correct enivornmental variables to allow the software to find the metis library on your computer
+
+#+BEGIN_SRC bash
+  export METIS_DLL=/path/to/libmetis.so
+#+END_SRC

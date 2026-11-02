@@ -1,0 +1,11 @@
+.python-version
+connectome_utils/connectome.py.before_partition
+connectome_utils/connectome.py.before_percore
+connectome_utils/connectome.py.before_percore_part
+connectome_utils/connectome.py.before_plasticity_api
+vivado.jou
+vivado.log
+vivado_1985571.backup.jou
+vivado_1985571.backup.log
+vivado_1987485.backup.jou
+vivado_1987485.backup.log

@@ -1,0 +1,344 @@
+//=============================================================================
+// HiAER-Spike FireFly Subsystem Top
+//
+// This is the top-level module for the FireFly inter-FPGA communication
+// subsystem. It instantiates Aurora channels and the routing logic.
+//
+// Integration with sixteen_core_top:
+//   1. Add this module to your design
+//   2. Connect spike interfaces to existing NoC
+//   3. Add GT pins to top-level port list
+//   4. Include firefly_pins.xdc constraints
+//
+// FPGA Configuration:
+//   - FPGA 0-3: Lower tier, only Port 7 Aurora channel
+//   - FPGA 4-7: Upper tier, all four Aurora channels
+//=============================================================================
+
+module firefly_subsystem_top
+    import hiaer_firefly_pkg::*;
+(
+    // Board identifier, from the host, passed through to the router.
+    input  logic [2:0] FPGA_ID,
+    //=========================================================================
+    // Clocks and Resets
+    //=========================================================================
+    input  logic            aclk,           // System clock (~225 MHz)
+    input  logic            aresetn,        // System reset (active low)
+    input  logic            init_clk,       // Aurora init clock (100 MHz)
+    
+    //=========================================================================
+    // GT Reference Clocks (directly from Si5328 jitter cleaners)
+    //=========================================================================
+    input  logic            ff4_refclk_p,   // Port 4 refclk (upper tier only)
+    input  logic            ff4_refclk_n,
+    input  logic            ff5_refclk_p,   // Port 5 refclk (upper tier only)
+    input  logic            ff5_refclk_n,
+    input  logic            ff6_refclk_p,   // Port 6 refclk (upper tier only)
+    input  logic            ff6_refclk_n,
+    input  logic            ff7_refclk_p,   // Port 7 refclk (all FPGAs)
+    input  logic            ff7_refclk_n,
+    
+    //=========================================================================
+    // GT Serial Pins (directly to FireFly connectors)
+    //=========================================================================
+    // Port 4
+    output logic [3:0]      ff4_txp,
+    output logic [3:0]      ff4_txn,
+    input  logic [3:0]      ff4_rxp,
+    input  logic [3:0]      ff4_rxn,
+    
+    // Port 5
+    output logic [3:0]      ff5_txp,
+    output logic [3:0]      ff5_txn,
+    input  logic [3:0]      ff5_rxp,
+    input  logic [3:0]      ff5_rxn,
+    
+    // Port 6
+    output logic [3:0]      ff6_txp,
+    output logic [3:0]      ff6_txn,
+    input  logic [3:0]      ff6_rxp,
+    input  logic [3:0]      ff6_rxn,
+    
+    // Port 7
+    output logic [3:0]      ff7_txp,
+    output logic [3:0]      ff7_txn,
+    input  logic [3:0]      ff7_rxp,
+    input  logic [3:0]      ff7_rxn,
+    
+    //=========================================================================
+    // Interface to Local NoC
+    // Connect these to your existing spike routing infrastructure
+    //=========================================================================
+    
+    // TX: Spikes from local cores going to other FPGAs
+    input  inter_fpga_spike_t   noc_tx_spike,
+    input  logic                noc_tx_valid,
+    output logic                noc_tx_ready,
+    
+    // RX: Spikes from other FPGAs going to local cores
+    output inter_fpga_spike_t   noc_rx_spike,
+    output logic                noc_rx_valid,
+    input  logic                noc_rx_ready,
+    
+    //=========================================================================
+    // Status and Debug
+    //=========================================================================
+    output logic [3:0]      channel_up,     // [3]=P7, [2]=P6, [1]=P5, [0]=P4
+    output logic [3:0]      hard_err,
+    output logic [31:0]     spikes_routed,
+    output logic [31:0]     spikes_dropped
+);
+
+    //=========================================================================
+    // Internal Signals
+    //=========================================================================
+    
+    // Aurora channel interfaces (router ↔ Aurora wrappers)
+    logic [63:0]    port4_tx_tdata, port4_rx_tdata;
+    logic           port4_tx_tvalid, port4_tx_tready;
+    logic           port4_rx_tvalid, port4_rx_tready;
+    logic           port4_channel_up, port4_hard_err;
+    
+    logic [63:0]    port5_tx_tdata, port5_rx_tdata;
+    logic           port5_tx_tvalid, port5_tx_tready;
+    logic           port5_rx_tvalid, port5_rx_tready;
+    logic           port5_channel_up, port5_hard_err;
+    
+    logic [63:0]    port6_tx_tdata, port6_rx_tdata;
+    logic           port6_tx_tvalid, port6_tx_tready;
+    logic           port6_rx_tvalid, port6_rx_tready;
+    logic           port6_channel_up, port6_hard_err;
+    
+    logic [63:0]    port7_tx_tdata, port7_rx_tdata;
+    logic           port7_tx_tvalid, port7_tx_tready;
+    logic           port7_rx_tvalid, port7_rx_tready;
+    logic           port7_channel_up, port7_hard_err;
+    
+    //=========================================================================
+    // Inter-FPGA Router
+    //=========================================================================
+    
+    inter_fpga_router #(
+        .TX_FIFO_DEPTH      (64),
+        .RX_FIFO_DEPTH      (64)
+    ) u_router (
+        .LOCAL_FPGA_ID      (FPGA_ID),
+        .aclk               (aclk),
+        .aresetn            (aresetn),
+        
+        // NoC interface
+        .noc_tx_spike       (noc_tx_spike),
+        .noc_tx_valid       (noc_tx_valid),
+        .noc_tx_ready       (noc_tx_ready),
+        .noc_rx_spike       (noc_rx_spike),
+        .noc_rx_valid       (noc_rx_valid),
+        .noc_rx_ready       (noc_rx_ready),
+        
+        // Port interfaces
+        .port4_tx_tdata     (port4_tx_tdata),
+        .port4_tx_tvalid    (port4_tx_tvalid),
+        .port4_tx_tready    (port4_tx_tready),
+        .port4_rx_tdata     (port4_rx_tdata),
+        .port4_rx_tvalid    (port4_rx_tvalid),
+        .port4_rx_tready    (port4_rx_tready),
+        .port4_channel_up   (port4_channel_up),
+        
+        .port5_tx_tdata     (port5_tx_tdata),
+        .port5_tx_tvalid    (port5_tx_tvalid),
+        .port5_tx_tready    (port5_tx_tready),
+        .port5_rx_tdata     (port5_rx_tdata),
+        .port5_rx_tvalid    (port5_rx_tvalid),
+        .port5_rx_tready    (port5_rx_tready),
+        .port5_channel_up   (port5_channel_up),
+        
+        .port6_tx_tdata     (port6_tx_tdata),
+        .port6_tx_tvalid    (port6_tx_tvalid),
+        .port6_tx_tready    (port6_tx_tready),
+        .port6_rx_tdata     (port6_rx_tdata),
+        .port6_rx_tvalid    (port6_rx_tvalid),
+        .port6_rx_tready    (port6_rx_tready),
+        .port6_channel_up   (port6_channel_up),
+        
+        .port7_tx_tdata     (port7_tx_tdata),
+        .port7_tx_tvalid    (port7_tx_tvalid),
+        .port7_tx_tready    (port7_tx_tready),
+        .port7_rx_tdata     (port7_rx_tdata),
+        .port7_rx_tvalid    (port7_rx_tvalid),
+        .port7_rx_tready    (port7_rx_tready),
+        .port7_channel_up   (port7_channel_up),
+        
+        .spikes_routed      (spikes_routed),
+        .spikes_dropped     (spikes_dropped),
+        .port_active        ()
+    );
+    
+    //=========================================================================
+    // Aurora Channel Instantiation
+    // Conditional instantiation based on FPGA tier
+    //=========================================================================
+    
+    generate
+        
+        //=====================================================================
+        // Port 7 - All FPGAs have this port
+        //=====================================================================
+        aurora_channel_wrapper #(
+            .PORT_NUM           (7),
+            .CDC_FIFO_DEPTH     (64)
+        ) u_aurora_port7 (
+            .aclk               (aclk),
+            .aresetn            (aresetn),
+            .init_clk           (init_clk),
+            .gt_refclk_p        (ff7_refclk_p),
+            .gt_refclk_n        (ff7_refclk_n),
+            .gt_txp             (ff7_txp),
+            .gt_txn             (ff7_txn),
+            .gt_rxp             (ff7_rxp),
+            .gt_rxn             (ff7_rxn),
+            .s_axis_tx_tdata    (port7_tx_tdata),
+            .s_axis_tx_tvalid   (port7_tx_tvalid),
+            .s_axis_tx_tready   (port7_tx_tready),
+            .m_axis_rx_tdata    (port7_rx_tdata),
+            .m_axis_rx_tvalid   (port7_rx_tvalid),
+            .m_axis_rx_tready   (port7_rx_tready),
+            .channel_up         (port7_channel_up),
+            .lane_up            (),
+            .hard_err           (port7_hard_err),
+            .soft_err           (),
+            .link_reset_out     (),
+            .loopback           (3'b000)
+        );
+        
+        assign channel_up[3] = port7_channel_up;
+        assign hard_err[3] = port7_hard_err;
+        
+        //=====================================================================
+        // Ports 4,5,6 - Upper tier FPGAs only (4,5,6,7)
+        //=====================================================================
+        if (1) begin : gen_all_ports
+            
+            // Port 6
+            aurora_channel_wrapper #(
+                .PORT_NUM           (6),
+                .CDC_FIFO_DEPTH     (64)
+            ) u_aurora_port6 (
+                .aclk               (aclk),
+                .aresetn            (aresetn),
+                .init_clk           (init_clk),
+                .gt_refclk_p        (ff6_refclk_p),
+                .gt_refclk_n        (ff6_refclk_n),
+                .gt_txp             (ff6_txp),
+                .gt_txn             (ff6_txn),
+                .gt_rxp             (ff6_rxp),
+                .gt_rxn             (ff6_rxn),
+                .s_axis_tx_tdata    (port6_tx_tdata),
+                .s_axis_tx_tvalid   (port6_tx_tvalid),
+                .s_axis_tx_tready   (port6_tx_tready),
+                .m_axis_rx_tdata    (port6_rx_tdata),
+                .m_axis_rx_tvalid   (port6_rx_tvalid),
+                .m_axis_rx_tready   (port6_rx_tready),
+                .channel_up         (port6_channel_up),
+                .lane_up            (),
+                .hard_err           (port6_hard_err),
+                .soft_err           (),
+                .link_reset_out     (),
+                .loopback           (3'b000)
+            );
+            
+            // Port 5
+            aurora_channel_wrapper #(
+                .PORT_NUM           (5),
+                .CDC_FIFO_DEPTH     (64)
+            ) u_aurora_port5 (
+                .aclk               (aclk),
+                .aresetn            (aresetn),
+                .init_clk           (init_clk),
+                .gt_refclk_p        (ff5_refclk_p),
+                .gt_refclk_n        (ff5_refclk_n),
+                .gt_txp             (ff5_txp),
+                .gt_txn             (ff5_txn),
+                .gt_rxp             (ff5_rxp),
+                .gt_rxn             (ff5_rxn),
+                .s_axis_tx_tdata    (port5_tx_tdata),
+                .s_axis_tx_tvalid   (port5_tx_tvalid),
+                .s_axis_tx_tready   (port5_tx_tready),
+                .m_axis_rx_tdata    (port5_rx_tdata),
+                .m_axis_rx_tvalid   (port5_rx_tvalid),
+                .m_axis_rx_tready   (port5_rx_tready),
+                .channel_up         (port5_channel_up),
+                .lane_up            (),
+                .hard_err           (port5_hard_err),
+                .soft_err           (),
+                .link_reset_out     (),
+                .loopback           (3'b000)
+            );
+            
+            // Port 4
+            aurora_channel_wrapper #(
+                .PORT_NUM           (4),
+                .CDC_FIFO_DEPTH     (64)
+            ) u_aurora_port4 (
+                .aclk               (aclk),
+                .aresetn            (aresetn),
+                .init_clk           (init_clk),
+                .gt_refclk_p        (ff4_refclk_p),
+                .gt_refclk_n        (ff4_refclk_n),
+                .gt_txp             (ff4_txp),
+                .gt_txn             (ff4_txn),
+                .gt_rxp             (ff4_rxp),
+                .gt_rxn             (ff4_rxn),
+                .s_axis_tx_tdata    (port4_tx_tdata),
+                .s_axis_tx_tvalid   (port4_tx_tvalid),
+                .s_axis_tx_tready   (port4_tx_tready),
+                .m_axis_rx_tdata    (port4_rx_tdata),
+                .m_axis_rx_tvalid   (port4_rx_tvalid),
+                .m_axis_rx_tready   (port4_rx_tready),
+                .channel_up         (port4_channel_up),
+                .lane_up            (),
+                .hard_err           (port4_hard_err),
+                .soft_err           (),
+                .link_reset_out     (),
+                .loopback           (3'b000)
+            );
+            
+            assign channel_up[0] = port4_channel_up;
+            assign channel_up[1] = port5_channel_up;
+            assign channel_up[2] = port6_channel_up;
+            assign hard_err[0] = port4_hard_err;
+            assign hard_err[1] = port5_hard_err;
+            assign hard_err[2] = port6_hard_err;
+            
+        end else begin : gen_lower_tier
+            
+            // Lower tier: Ports 4,5,6 not connected - tie off
+            assign ff4_txp = 4'b0;
+            assign ff4_txn = 4'b0;
+            assign ff5_txp = 4'b0;
+            assign ff5_txn = 4'b0;
+            assign ff6_txp = 4'b0;
+            assign ff6_txn = 4'b0;
+            
+            assign port4_tx_tready = 1'b0;
+            assign port4_rx_tdata = 64'd0;
+            assign port4_rx_tvalid = 1'b0;
+            assign port4_channel_up = 1'b0;
+            
+            assign port5_tx_tready = 1'b0;
+            assign port5_rx_tdata = 64'd0;
+            assign port5_rx_tvalid = 1'b0;
+            assign port5_channel_up = 1'b0;
+            
+            assign port6_tx_tready = 1'b0;
+            assign port6_rx_tdata = 64'd0;
+            assign port6_rx_tvalid = 1'b0;
+            assign port6_channel_up = 1'b0;
+            
+            assign channel_up[2:0] = 3'b0;
+            assign hard_err[2:0] = 3'b0;
+            
+        end
+        
+    endgenerate
+
+endmodule : firefly_subsystem_top

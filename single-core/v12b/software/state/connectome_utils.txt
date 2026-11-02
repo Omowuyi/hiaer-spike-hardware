@@ -1,0 +1,19 @@
+repository: /home/omowuyi/testing/connectome_utils
+branch: v3_multicore
+HEAD: 4a99d8d3e1be535da7799fff744cb39e4971b7cd
+remote: origin	git@github.com:Integrated-Systems-Neuroengineering/connectome_utils.git (fetch)
+remote: origin	git@github.com:Integrated-Systems-Neuroengineering/connectome_utils.git (push)
+--- status
+ M connectome_utils/__pycache__/connectome.cpython-310.pyc
+ M connectome_utils/connectome.py
+?? .python-version
+?? connectome_utils/connectome.py.before_partition
+?? connectome_utils/connectome.py.before_percore
+?? connectome_utils/connectome.py.before_percore_part
+?? connectome_utils/connectome.py.before_plasticity_api
+?? vivado.jou
+?? vivado.log
+?? vivado_1985571.backup.jou
+?? vivado_1985571.backup.log
+?? vivado_1987485.backup.jou
+?? vivado_1987485.backup.log

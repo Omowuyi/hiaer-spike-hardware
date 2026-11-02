@@ -1,0 +1,44 @@
+#---
+#FPGA_cluster:
+#  - FPGA:
+#    - Core_cluster:
+#      - Cores: '1'
+##      - Cores: '2'
+##    - Core_cluster:
+##      - Cores: '2'
+##      - Cores: '2'
+##  - FPGA:
+##    - Core_cluster:
+##      - Cores: '1'
+##      - Cores: '2'
+##    - Core_cluster:
+##      - Cores: '2'
+##      - Cores: '4'
+#
+#
+#inputs_file: 'HTM/SpHyRE-Net Output/inputs_2021-01-04_14-25.txt'
+#outputs_file: 'test_output.txt'
+#connectivity_file: 'HTM/SpHyRE-Net Output/conex_2021-01-04_14-25.txt'
+#neuron_type: 'I&F'
+#global_neuron_params:
+#  v_alpha : 0
+#  v_thr : 0
+#  v_rst : 0
+#run_time : 18 #ms
+#
+#
+#n_ng : 8
+#ptrs_per_row : 8
+#data_per_row : 8
+#
+#
+#
+---
+FPGA_cluster:
+  - FPGA:
+    - Core_cluster:
+      - Cores: '1'
+
+n_ng : 16
+ptrs_per_row : 8
+data_per_row : 8
