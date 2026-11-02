@@ -1,3 +1,0 @@
-Validation Accuracy: 98.62%
-Test Accuracy: 97.83%
-FPGA Converted Accuracy: 97.60%

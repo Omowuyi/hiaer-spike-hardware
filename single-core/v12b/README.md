@@ -20,9 +20,8 @@ the 16-core NoC fabric; multi-core operation is not part of this design's verifi
   (round33_kit; slice_kit/sim_round34.sh), the backup and restore proof (backup_v12_kit), the 16-core testbench (noc16_kit).
 - verification/: round 33 and round 34 gate logs (both PASS), the 16-core position gate.
 - build_reports/: placement and routing utilization and timing.
-- software/: hs_bridge, hs_api and connectome_utils as used with this bitstream, and software/state/: each repository's
-  branch, HEAD, uncommitted diff and untracked files, and the Python package list.  Files over 5 MB (model fixtures,
-  datasets) are listed in software/EXCLUDED_LARGE_FILES.txt; the complete trees are in the software backup.
+- software/: where the software used with this bitstream lives (branch v12b_tested in hs_bridge, hs_api and
+  connectome_utils), and software/state/: each repository's branch, commit and uncommitted changes at test time.
 
 ## Reproduce
 The self-contained Vivado archive (with the restore proof) and the full working tree are kept in /data/omowuyi/backups on

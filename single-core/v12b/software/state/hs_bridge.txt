@@ -8,7 +8,6 @@ remote: origin	git@github.com:Integrated-Systems-Neuroengineering/hs_bridge.git 
  M hs_bridge/FPGA_Execution/fpga_controller.py
  M hs_bridge/compile_network.py
  M hs_bridge/network.py
-?? .claude/
 ?? .python-version
 ?? h
 ?? "h_spikes and readSelect\""

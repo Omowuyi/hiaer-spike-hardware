@@ -1,4 +1,3 @@
-.claude/settings.local.json
 .python-version
 h
 "h_spikes and readSelect\""
