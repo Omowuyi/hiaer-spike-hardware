@@ -1,0 +1,334 @@
+//=============================================================================
+// Spike Classifier Module
+//
+// This module sits between the switch_16_1 output and:
+// - PCIe (for local spikes that stay on this FPGA or go to host)
+// - FireFly (for remote spikes going to other FPGAs)
+//
+// Packet Format (512-bit NoC packet):
+//   [511:480] - Header (0xEEEE_EEEE for spike packet)
+//   [479:448] - Spike 13 (if valid)
+//   ...
+//   [63:32]   - Spike 0 (if valid)
+//   [31:0]    - execRun timestamp
+//
+// Each 32-bit spike:
+//   [31:24]   - Timestamp
+//   [23]      - Valid bit
+//   [22:17]   - Reserved
+//   [16:0]    - Destination neuron address
+//
+// The classifier examines each spike's destination to determine:
+// - Local spike: dst_fpga == LOCAL_FPGA_ID → forward to PCIe
+// - Remote spike: dst_fpga != LOCAL_FPGA_ID → convert to 64-bit and send to FireFly
+//=============================================================================
+
+module spike_classifier
+    import hiaer_firefly_pkg::*;
+#(
+    parameter int         BLOCK_BITS    = 10     // addr[18:9] -> 1024 blocks
+)(
+    // Board identifier, from the host. Note that the destination table is
+    // seeded from this at reset, so it must be set before the tables load.
+    input  logic [2:0]      LOCAL_FPGA_ID,
+    input  logic            aclk,
+    input  logic            aresetn,
+    
+    //=========================================================================
+    // Input from switch_16_1 (512-bit NoC packets)
+    //=========================================================================
+    input  logic [511:0]    s_axis_tdata,
+    input  logic            s_axis_tvalid,
+    output logic            s_axis_tready,
+    
+    //=========================================================================
+    // Output to PCIe (local spikes, 512-bit format)
+    //=========================================================================
+    //=========================================================================
+    // FIX AC: remote destination table.  Which FPGA holds a neuron is a
+    // property of the partition, not of the address -- the same reason the NoC
+    // uses a routing table instead of decoding bits.  Loaded by CMD 16.
+    //=========================================================================
+    input  logic            remote_cfg_valid,
+    input  logic [9:0]      remote_cfg_addr,
+    input  logic [5:0]      remote_cfg_data,   // {server[2:0], fpga[2:0]}
+
+    output logic [511:0]    m_pcie_tdata,
+    output logic            m_pcie_tvalid,
+    input  logic            m_pcie_tready,
+    
+    //=========================================================================
+    // Output to FireFly (remote spikes, 64-bit format)
+    //=========================================================================
+    output inter_fpga_spike_t   m_firefly_spike,
+    output logic                m_firefly_valid,
+    input  logic                m_firefly_ready
+);
+
+    //=========================================================================
+    // Constants
+    //=========================================================================
+    
+    localparam SPIKE_HEADER = 32'hEEEE_EEEE;
+    localparam MAX_SPIKES   = 14;  // Up to 14 spikes per packet
+    
+    //=========================================================================
+    // State Machine
+    //=========================================================================
+    
+    typedef enum logic [2:0] {
+        ST_IDLE,
+        ST_CLASSIFY,
+        ST_SEND_LOCAL,
+        ST_SEND_REMOTE,
+        ST_DONE
+    } state_t;
+    
+    state_t state, next_state;
+    
+    //=========================================================================
+    // Packet Buffering and Classification
+    //=========================================================================
+    
+    logic [511:0]   packet_reg;
+    logic [31:0]    spike_data [MAX_SPIKES-1:0];
+    logic [18:0]    spike_addr [MAX_SPIKES-1:0];
+    logic           spike_valid [MAX_SPIKES-1:0];
+    logic [2:0]     spike_dst_fpga [MAX_SPIKES-1:0];
+    logic [3:0]     spike_dst_core [MAX_SPIKES-1:0];
+    
+    // Classification results
+    logic [MAX_SPIKES-1:0]  local_spike_mask;
+    logic [MAX_SPIKES-1:0]  remote_spike_mask;
+    logic                   has_local_spikes;
+    logic                   has_remote_spikes;
+    
+    // Counters
+    logic [3:0]     spike_idx;
+    logic [7:0]     exec_run;
+    
+    //=========================================================================
+    // Destination Extraction Functions
+    // The neuron address encodes FPGA and core information
+    // Format: {fpga[2:0], core[3:0], neuron[16:0]} = 24 bits total
+    // But we only have 17 bits, so we need a different encoding:
+    //   [16:14] = dst_fpga (3 bits)
+    //   [13:10] = dst_core (4 bits)  
+    //   [9:0]   = neuron_id (10 bits, supports up to 1024 neurons per core)
+    //
+    // For larger neuron counts, use different encoding or lookup table
+    //=========================================================================
+    
+    //=========================================================================
+    // FIX AC: destination lookup, one entry per 512-neuron block.
+    //
+    // Registers, not BRAM: up to 14 spikes in a packet are classified in the
+    // same cycle, and a BRAM would force 14 sequential reads.  256 x 6 = 1536
+    // flops is negligible on this part and keeps the timing as it was.
+    //
+    // Reset value 0 means "this FPGA", so an unprogrammed table behaves as a
+    // single-FPGA system rather than scattering spikes onto Aurora.
+    //=========================================================================
+    logic [5:0] remote_dst [0:1023];
+
+    integer ri;
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            for (ri = 0; ri < 256; ri = ri + 1)
+                remote_dst[ri] <= {3'd0, LOCAL_FPGA_ID};
+        end else if (remote_cfg_valid) begin
+            remote_dst[remote_cfg_addr] <= remote_cfg_data;
+        end
+    end
+
+    function automatic logic [2:0] get_dest_fpga(input logic [18:0] addr);
+        // addr[16:9] selects the 512-neuron block -- the same granularity the
+        // NoC routing table uses, so one partition drives both.
+        return remote_dst[addr[18:9]][2:0];
+    endfunction
+
+    function automatic logic [2:0] get_dest_server(input logic [18:0] addr);
+        return remote_dst[addr[18:9]][5:3];
+    endfunction
+    
+    // FIX AC: the destination CORE is not the sender's to decide.  The
+    // receiving FPGA's routing tables select cores from the neuron address,
+    // exactly as they do for a locally generated spike, and a spike may reach
+    // several cores there.  Sending a single core index would be both wrong
+    // and unnecessary -- dst_neuron already carries the full 17 bits.
+    function automatic logic [3:0] get_dest_core(input logic [18:0] addr);
+        return 4'd0;
+    endfunction
+    
+    // FIX AC: the whole 17-bit address is the neuron index within the
+    // destination FPGA.  Truncating to 10 bits assumed 1024 neurons per core;
+    // a core holds 8192.
+    function automatic logic [18:0] get_dest_neuron(input logic [18:0] addr);
+        return addr;
+    endfunction
+    
+    //=========================================================================
+    // Packet Parsing and Classification
+    //=========================================================================
+    
+    always_ff @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            state <= ST_IDLE;
+            packet_reg <= 512'd0;
+            spike_idx <= 4'd0;
+            exec_run <= 8'd0;
+            local_spike_mask <= {MAX_SPIKES{1'b0}};
+            remote_spike_mask <= {MAX_SPIKES{1'b0}};
+            
+            for (int i = 0; i < MAX_SPIKES; i++) begin
+                spike_data[i] <= 32'd0;
+                spike_addr[i] <= 19'd0;
+                spike_valid[i] <= 1'b0;
+                spike_dst_fpga[i] <= 3'd0;
+                spike_dst_core[i] <= 4'd0;
+            end
+        end else begin
+            case (state)
+                ST_IDLE: begin
+                    spike_idx <= 4'd0;
+                    local_spike_mask <= {MAX_SPIKES{1'b0}};
+                    remote_spike_mask <= {MAX_SPIKES{1'b0}};
+                    
+                    if (s_axis_tvalid && s_axis_tready) begin
+                        packet_reg <= s_axis_tdata;
+                        exec_run <= s_axis_tdata[7:0];
+                        
+                        // Check if this is a spike packet
+                        if (s_axis_tdata[511:480] == SPIKE_HEADER) begin
+                            state <= ST_CLASSIFY;
+                        end else begin
+                            // Non-spike packet (command) - send to PCIe
+                            state <= ST_SEND_LOCAL;
+                        end
+                    end
+                end
+                
+                ST_CLASSIFY: begin
+                    // Parse all spikes and classify them
+                    for (int i = 0; i < MAX_SPIKES; i++) begin
+                        spike_data[i] <= packet_reg[32*(i+1) +: 32];
+                        spike_valid[i] <= packet_reg[32*(i+1) + 23];  // Valid bit
+                        spike_addr[i] <= packet_reg[32*(i+1) +: 19];  // Neuron address
+                        
+                        // Extract destination
+                        spike_dst_fpga[i] <= get_dest_fpga(packet_reg[32*(i+1) +: 19]);
+                        spike_dst_core[i] <= get_dest_core(packet_reg[32*(i+1) +: 19]);
+                        
+                        // Classify: local or remote
+                        if (packet_reg[32*(i+1) + 23]) begin  // If valid
+                            if (get_dest_fpga(packet_reg[32*(i+1) +: 19]) == LOCAL_FPGA_ID) begin
+                                local_spike_mask[i] <= 1'b1;
+                            end else begin
+                                remote_spike_mask[i] <= 1'b1;
+                            end
+                        end
+                    end
+                    
+                    // Determine next state based on what we found
+                    if (|local_spike_mask || |remote_spike_mask) begin
+                        // Prioritize local spikes first
+                        if (|local_spike_mask) begin
+                            state <= ST_SEND_LOCAL;
+                        end else begin
+                            state <= ST_SEND_REMOTE;
+                        end
+                    end else begin
+                        state <= ST_IDLE;
+                    end
+                end
+                
+                ST_SEND_LOCAL: begin
+                    if (m_pcie_tready) begin
+                        // After sending local packet, check for remote spikes
+                        if (|remote_spike_mask) begin
+                            spike_idx <= 4'd0;
+                            state <= ST_SEND_REMOTE;
+                        end else begin
+                            state <= ST_IDLE;
+                        end
+                    end
+                end
+                
+                ST_SEND_REMOTE: begin
+                    if (m_firefly_ready || !remote_spike_mask[spike_idx]) begin
+                        if (spike_idx < MAX_SPIKES - 1) begin
+                            spike_idx <= spike_idx + 1;
+                        end else begin
+                            state <= ST_IDLE;
+                        end
+                    end
+                end
+                
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+    
+    //=========================================================================
+    // Status Flags
+    //=========================================================================
+    
+    assign has_local_spikes = |local_spike_mask;
+    assign has_remote_spikes = |remote_spike_mask;
+    
+    //=========================================================================
+    // Input Ready
+    //=========================================================================
+    
+    assign s_axis_tready = (state == ST_IDLE);
+    
+    //=========================================================================
+    // PCIe Output (Local Spikes)
+    // Forward the original packet for local spikes
+    //=========================================================================
+    
+    // Build local-only packet (mask out remote spikes)
+    logic [511:0] local_packet;
+    
+    always_comb begin
+        local_packet = packet_reg;
+        // Optionally mask out remote spikes from the packet
+        // For now, we send the full packet to maintain compatibility
+    end
+    
+    assign m_pcie_tdata = local_packet;
+    assign m_pcie_tvalid = (state == ST_SEND_LOCAL);
+    
+    //=========================================================================
+    // FireFly Output (Remote Spikes)
+    // Convert 32-bit spike to 64-bit inter_fpga_spike_t format
+    //=========================================================================
+    
+    always_comb begin
+        m_firefly_spike = '0;
+        m_firefly_valid = 1'b0;
+        
+        if (state == ST_SEND_REMOTE && spike_idx < MAX_SPIKES && remote_spike_mask[spike_idx]) begin
+            // Convert 32-bit spike to 64-bit extended format
+            m_firefly_spike.opcode      = OP_SPIKE;
+            // FIX AC: was hardcoded 3'd0, which confines the system to one
+            // server.  The same table that names the FPGA names the server,
+            // so multi-server needs no extra mechanism -- only a partition
+            // that fills these entries.
+            m_firefly_spike.dst_server  = get_dest_server(spike_addr[spike_idx]);
+            m_firefly_spike.dst_fpga    = spike_dst_fpga[spike_idx];
+            m_firefly_spike.dst_core    = spike_dst_core[spike_idx];
+            m_firefly_spike.dst_neuron  = spike_addr[spike_idx];
+            m_firefly_spike.src_fpga    = LOCAL_FPGA_ID;
+            // command_interpreter.v line 517 puts the emitting core at bits
+            // [20:17] of every 32-bit spike word, immediately above the
+            // neuron address this module already slices out.
+            m_firefly_spike.src_core    = packet_reg[32*(spike_idx+1) + 19 +: 4];
+            m_firefly_spike.timestamp   = exec_run;
+            m_firefly_spike.ttl         = 3'd3;  // 3-hop TTL
+            m_firefly_spike.payload     = 16'd1; // Default weight
+            m_firefly_valid = 1'b1;
+        end
+    end
+
+endmodule : spike_classifier

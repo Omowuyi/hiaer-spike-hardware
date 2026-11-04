@@ -1,0 +1,18 @@
+v12 hardware tests, core 5, Wed Nov  4 09:07:03 PST 2026  bitstream d54c44822063
+feature word                       PASS (0xff)
+fast_suite                         PASS (42 passed)
+sequence_fanout_fanin_noise        PASS (3 passed)
+fanin_9000                         PASS (1 passed)
+bio_suite                          PASS (13 passed)
+F09 x16                            core 1 only (F09/F10 also run once in the bio suite)
+F10 x8                             core 1 only
+syn64_long_delay                   PASS (1 passed)
+isolated_firing_64                 PASS (1 passed)
+isolated_firing_32                 PASS (1 passed)
+plasticity_protocol                PASS (1 passed)
+plasticity weights vs reference    PASS plasticity-on: 80 steps, 28 synapses (28 changed from w0), 3 rewards; 0 mis
+heavy_spike                        PASS (1 passed)
+heavy-spike host count             host saw 55295 spikes over 30 steps
+heavy-spike card vs simulation     PASS card identical to simulation at every step
+status bits 16-19                  PASS (never set in any test group)
+delay slot overflow (fix 25)       PASS (1023 delivered, bit 18 set)

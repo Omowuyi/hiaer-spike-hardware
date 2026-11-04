@@ -1,0 +1,1 @@
+bedf896 hardware suite: v12c as the default bitstream; the sweep verdict no longer counts core 1 only repetition rows on other cores

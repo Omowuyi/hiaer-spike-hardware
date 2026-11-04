@@ -1,0 +1,43 @@
+test \ core                          0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+feature word                         P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+fast_suite                           P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+sequence_fanout_fanin_noise          P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+fanin_9000                           P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+bio_suite                            P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+F09 x16                              -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10 x8                               -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+syn64_long_delay                     P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+isolated_firing_64                   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+isolated_firing_32                   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+plasticity_protocol                  P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+plasticity weights vs reference      P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+heavy_spike                          P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+heavy-spike host count               -   -   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+heavy-spike card vs simulation       P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+status bits 16-19                    P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+delay slot overflow (fix 25)         P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P
+F09_run1                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run2                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run3                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run4                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run5                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run6                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run7                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run8                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run9                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run10                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run11                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run12                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run13                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run14                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run15                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F09_run16                            -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run1                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run2                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run3                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run4                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run5                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run6                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run7                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+F10_run8                             -   P   -   -   -   -   -   -   -   -   -   -   -   -   -   -
+ALL PASS ON EVERY CORE
