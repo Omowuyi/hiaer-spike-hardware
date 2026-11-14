@@ -1,0 +1,94 @@
+==== build_v14 trial Fri Nov 13 03:02:46 PST 2026
+SYNTH: synth_design Complete!
+SLICE CELLS: mode 15 30720, mode 12 0
+V13 CELLS: resetn_l 16, noc_quiet counter bits 7, relay-pass arming registers 16, barrier go registers 2
+nets with MARK_DEBUG: 5233
+core_wrapper instances with taps: 16
+  genblk3[0].my_core
+  genblk3[10].my_core
+  genblk3[11].my_core
+  genblk3[12].my_core
+  genblk3[13].my_core
+  genblk3[14].my_core
+  genblk3[15].my_core
+  genblk3[1].my_core
+  genblk3[2].my_core
+  genblk3[3].my_core
+  genblk3[4].my_core
+  genblk3[5].my_core
+  genblk3[6].my_core
+  genblk3[7].my_core
+  genblk3[8].my_core
+  genblk3[9].my_core
+core 1 = genblk3[1].my_core
+  probe inst/hbmp/dbg_tx_state                     4 bits
+  probe inst/hbmp/dbg_rx_state                     4 bits
+  probe inst/hbmp/dbg_tx_ptr_ctr                  23 bits
+  probe inst/hbmp/dbg_rx_ptr_ctr                  23 bits
+  probe inst/hbmp/dbg_wait_clks_cnt                8 bits
+  probe inst/hbmp/dbg_wait_clks_done_cnt           5 bits
+  probe inst/hbmp/dbg_phase                        6 bits
+  probe inst/hbmp/dbg_in                           3 bits
+  probe inst/hbmp/dbg_fifo                         4 bits
+  probe inst/hbmp/dbg_axi                          5 bits
+  probe inst/iep/dbg_iep_state                     4 bits
+  probe inst/iep/dbg_iep_timeout                  11 bits
+  probe inst/iep/dbg_iep_flags                     4 bits
+  probe inst/eep/dbg_eep_state                     3 bits
+  probe inst/eep/dbg_eep_flags                     2 bits
+  probe inst/ptf_fifo_controller/dbg_pfc_wren      1 bits
+  probe inst/ci/dbg_ci_rx_state                    4 bits
+  probe inst/ci/dbg_ci_tx_state                    4 bits
+  probe inst/ci/dbg_ci_flags                       2 bits
+  probe inst/dbg_bram_spiked                      16 bits
+  probe inst/dbg_uram_spiked                      16 bits
+  probe inst/dbg_p2done                            2 bits
+all 22 taps found on core 1, 154 bits
+ILA clock net: genblk3[1].my_core/aclk450
+ILA u_ila_c1: 22 probes connected
+HS PROBES: 384 counter bits in 16 cores (6 counters x 4 bits each)
+ILA u_ila_hs: 384 probe bits connected
+ILA cells after opt_design: 7157
+POST-PLACEMENT WNS: 0.360   WHS: -1.219   (estimates before routing)
+CDC REVIEW: reports written (cdc_summary.rpt, cdc_critical.rpt) -- to be reviewed before the finish
+FIX29 after placement:   genblk3[0].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[10].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[11].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[12].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[13].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[14].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[15].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[1].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[2].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[3].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[4].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[5].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[6].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[7].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[8].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement:   genblk3[9].my_core/inst/hbmp/resetn_l_reg
+FIX29 after placement: PASS (16 local resetn_l, each from its own synchroniser, no loads outside its core, no synchroniser copies)
+HS PROBES after placement: 384 counter flip-flops, worst setup +0.843, worst hold +0.043
+TRIAL_DONE: placed checkpoint /data/omowuyi/multicore_noc_v13/v14_build/placed.dcp; reports place_util_slr.rpt, place_util.rpt, place_timing.rpt
+==== build_v14 finish Fri Nov 13 07:01:52 PST 2026
+FIX29 after routing:   genblk3[0].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[10].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[11].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[12].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[13].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[14].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[15].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[1].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[2].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[3].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[4].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[5].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[6].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[7].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[8].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing:   genblk3[9].my_core/inst/hbmp/resetn_l_reg
+FIX29 after routing: PASS (16 local resetn_l, each from its own synchroniser, no loads outside its core, no synchroniser copies)
+HS PROBES after routing: 384 counter flip-flops, worst setup +0.453, worst hold +0.012
+WNS: 0.001   WHS: 0.001
+TIMING MET
+DONE: /data/omowuyi/multicore_noc_v13/v14_build/sixteen_core_noc_v14_ila.bit and .ltx

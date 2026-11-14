@@ -52,3 +52,8 @@ echo "4144 903f" | sudo tee /sys/bus/pci/drivers/adxdma/new_id
 The 2024 reference reaches DVS large 64.24%; L6m reaches 56.60%. The difference
 was traced to the XDMA IP version — v4.1.4 against v4.1.29 — not to any
 difference in neuron behaviour.
+
+## v14 (multi-core, 16-core NoC, fixes 1-35)
+- file: /bitstreams/sixteen_core_noc_v14_ila.bit on crisdsc0
+- md5: f1014cec1e5e98434ef2a5959866113d
+- design, reports and verification: multi-core/v14
